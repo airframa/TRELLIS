@@ -54,10 +54,11 @@ def validate_trellis_format(source_dir, output_dir):
     sample_car_id = metadata['sha256'].iloc[0]
     print(f"Using sample car ID: {sample_car_id}")
     
-    # Step 4: Check expected directory structure
+    # Step 4: Check expected TRELLIS directory structure (FIXED)
     required_dirs = [
-        output_path / sample_car_id / "renders" / sample_car_id,
-        output_path / sample_car_id / "voxels",
+        output_path / "renders" / sample_car_id,
+        output_path / "voxels",
+        output_path / "features" / "dinov2_vitl14_reg",
     ]
     
     for dir_path in required_dirs:
@@ -67,8 +68,8 @@ def validate_trellis_format(source_dir, output_dir):
         else:
             print(f"✓ Found directory: {dir_path}")
     
-    # Step 5: Check for transforms.json
-    transforms_path = output_path / sample_car_id / "renders" / sample_car_id / "transforms.json"
+    # Step 5: Check for transforms.json (FIXED path)
+    transforms_path = output_path / "renders" / sample_car_id / "transforms.json"
     if not transforms_path.exists():
         print(f"❌ transforms.json not found at {transforms_path}")
         return False
@@ -81,22 +82,17 @@ def validate_trellis_format(source_dir, output_dir):
         print(f"❌ Failed to load transforms.json: {e}")
         return False
     
-    # Step 6: Check for voxel data
-    voxel_path = output_path / sample_car_id / "voxels" / f"{sample_car_id}.npy"
-    if not voxel_path.exists():
-        print(f"❌ Voxel data not found at {voxel_path}")
+    # Step 6: Check for voxel data (FIXED path)
+    voxel_ply_path = output_path / "voxels" / f"{sample_car_id}.ply"
+    if not voxel_ply_path.exists():
+        print(f"❌ Voxel PLY file not found at {voxel_ply_path}")
         return False
+    else:
+        print(f"✓ Found voxel PLY file: {voxel_ply_path}")
     
-    try:
-        voxel_data = np.load(voxel_path)
-        print(f"✓ Successfully loaded voxel data with shape {voxel_data.shape}")
-    except Exception as e:
-        print(f"❌ Failed to load voxel data: {e}")
-        return False
-    
-    # Step 7: Check for rendered images
+    # Step 7: Check for rendered images (FIXED path)
     first_frame = transforms['frames'][0]['file_path']
-    image_path = output_path / sample_car_id / "renders" / sample_car_id / first_frame.replace("./", "")
+    image_path = output_path / "renders" / sample_car_id / first_frame.replace("./", "")
     
     if not image_path.exists():
         print(f"❌ Rendered image not found at {image_path}")
@@ -104,21 +100,28 @@ def validate_trellis_format(source_dir, output_dir):
     else:
         print(f"✓ Found rendered image: {image_path}")
     
-    # Step 8: Check mesh.ply
-    mesh_path = output_path / sample_car_id / "renders" / sample_car_id / "mesh.ply"
+    # Step 8: Check mesh.ply (FIXED path)
+    mesh_path = output_path / "renders" / sample_car_id / "mesh.ply"
     if not mesh_path.exists():
         print(f"❌ Mesh file not found at {mesh_path}")
         return False
     else:
         print(f"✓ Found mesh file: {mesh_path}")
     
-    # Step 9: Try loading the data with TRELLIS dataloaders
+    # Step 9: Check for DINOv2 features (FIXED path)
+    features_path = output_path / "features" / "dinov2_vitl14_reg" / f"{sample_car_id}.npz"
+    if not features_path.exists():
+        print(f"❌ DINOv2 features not found at {features_path}")
+    else:
+        print(f"✓ Found DINOv2 features: {features_path}")
+    
+    # Step 10: Try loading the data with TRELLIS dataloaders
     try:
         # Test SparseStructure dataloader
         print("\nTesting TRELLIS dataloaders...")
         print("1. Testing SparseStructure dataloader")
         dataset_ss = SparseStructure(
-            roots=output_dir,
+            roots=str(output_dir),
             resolution=64,
             min_aesthetic_score=0.0  # Set to 0 to include all processed cars
         )
@@ -133,17 +136,20 @@ def validate_trellis_format(source_dir, output_dir):
             print(f"  Sample SS shape: {sample['ss'].shape}")
         except Exception as e:
             print(f"❌ Failed to load a sample from SparseStructure dataset: {e}")
+            import traceback
+            traceback.print_exc()
     except Exception as e:
         print(f"❌ Failed to initialize SparseStructure dataset: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Test SparseFeat2Render dataloader if DinoV2 features were extracted
     try:
         print("\n2. Testing SparseFeat2Render dataloader")
-        dino_features_path = output_path / sample_car_id / "features" / "dinov2_vitl14_reg"
         
-        if dino_features_path.exists() and len(list(dino_features_path.glob("*.npz"))) > 0:
+        if features_path.exists():
             dataset_feat = SparseFeat2Render(
-                roots=output_dir,
+                roots=str(output_dir),
                 image_size=224,
                 model='dinov2_vitl14_reg',
                 resolution=64,
@@ -156,22 +162,28 @@ def validate_trellis_format(source_dir, output_dir):
                 sample = dataset_feat[0]
                 print(f"✓ Successfully loaded a sample from SparseFeat2Render dataset")
                 print(f"  Sample contains keys: {list(sample.keys())}")
+                print(f"  Sample feature shape: {sample['feats'].shape}")
+                print(f"  Sample coords shape: {sample['coords'].shape}")
             except Exception as e:
                 print(f"❌ Failed to load a sample from SparseFeat2Render dataset: {e}")
+                import traceback
+                traceback.print_exc()
         else:
             print("ℹ️ Skipping SparseFeat2Render test - DinoV2 features not found")
     except Exception as e:
         print(f"❌ Failed to initialize SparseFeat2Render dataset: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Test SLat2Render dataloader if latents were extracted
     try:
         print("\n3. Testing SLat2Render dataloader")
-        latents_path = output_path / sample_car_id / "latents"
+        latents_path = output_path / "latents"
         
-        if latents_path.exists() and len(list(latents_path.glob("*/*.npz"))) > 0:
+        if latents_path.exists() and any(latents_path.glob("*/*.npz")):
             latent_model = os.listdir(latents_path)[0]
             dataset_slat = SLat2Render(
-                roots=output_dir,
+                roots=str(output_dir),
                 image_size=224,
                 latent_model=latent_model,
                 min_aesthetic_score=0.0
@@ -185,10 +197,14 @@ def validate_trellis_format(source_dir, output_dir):
                 print(f"  Sample contains keys: {list(sample.keys())}")
             except Exception as e:
                 print(f"❌ Failed to load a sample from SLat2Render dataset: {e}")
+                import traceback
+                traceback.print_exc()
         else:
             print("ℹ️ Skipping SLat2Render test - latent features not found")
     except Exception as e:
         print(f"❌ Failed to initialize SLat2Render dataset: {e}")
+        import traceback
+        traceback.print_exc()
     
     print("\n✅ Validation complete!")
     return True
