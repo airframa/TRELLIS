@@ -76,9 +76,11 @@ class RealCar3DProcessor:
 
         # Prepare transforms.json for TRELLIS format
         transforms = {
-            "camera_angle_x": 1.0,  # Default value, will be updated from first frame
             "frames": []
         }
+
+        # Store camera parameters for sampled frames
+        sampled_camera_params = {}
 
         # Process each sampled view
         for idx, frame_idx in enumerate(sampled_indices):
@@ -99,11 +101,7 @@ class RealCar3DProcessor:
             img.save(output_image_path)
 
             # Convert camera parameters to TRELLIS format
-            cam_trellis = self.convert_camera_params(frame_data['camera_params'], scale)
-
-            # # Set camera_angle_x from first frame (ensuring it exists)
-            # if idx == 0 and 'camera_angle_x' in cam_trellis:
-            #     transforms["camera_angle_x"] = cam_trellis['camera_angle_x']
+            cam_trellis, K, c2w = self.convert_camera_params(frame_data['camera_params'], scale, frame_data['frame_num'])
 
             # Add frame to transforms (only transform_matrix goes in frames)
             transforms["frames"].append({
@@ -112,10 +110,12 @@ class RealCar3DProcessor:
                 "camera_angle_x": cam_trellis['camera_angle_x']
             })
 
-        # Ensure camera_angle_x is a valid number
-        if not isinstance(transforms["camera_angle_x"], (int, float)) or transforms["camera_angle_x"] <= 0:
-            print(f"Warning: Invalid camera_angle_x value: {transforms['camera_angle_x']}, using default 1.0")
-            transforms["camera_angle_x"] = 1.0
+            # Store camera parameters for DINOv2 processing
+            sampled_camera_params[idx] = {
+                'K': K,
+                'c2w': c2w,
+                'original_frame_idx': frame_idx
+            }
 
         # Save transforms.json
         with open(renders_dir / "transforms.json", 'w') as f:
@@ -148,8 +148,8 @@ class RealCar3DProcessor:
         # Calculate aesthetic score
         aesthetic_score = self.calculate_aesthetic_score(mesh, renders_dir)
 
-        # Extract DINOv2 features
-        self.extract_dino_features(renders_dir, mesh, car_id)
+        # Extract DINOv2 features (pass sampled_camera_params instead of frames_data)
+        self.extract_dino_features(renders_dir, mesh, car_id, sampled_camera_params)
 
         # Create metadata CSV entry
         metadata = {
@@ -165,9 +165,11 @@ class RealCar3DProcessor:
         print(f"Processed {len(transforms['frames'])} images for {car_id}")
         return metadata
 
-    def convert_camera_params(self, cam_3drealcar, mesh_scale):
+    def convert_camera_params(self, cam_3drealcar, mesh_scale, frame_num):
         """Convert 3DRealCar camera format to TRELLIS format"""
         camera_trellis = {}
+        K = None
+        c2w = None
 
         # Default camera_angle_x if not found
         camera_trellis['camera_angle_x'] = 1.0  # Default FOV
@@ -229,9 +231,89 @@ class RealCar3DProcessor:
             print("Warning: No cameraPoseARFrame found, using identity matrix")
             camera_trellis['transform_matrix'] = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
 
-        return camera_trellis
+        # print(f"View {frame_num} -> camera_angle_x: {camera_trellis['camera_angle_x']}")
 
-    def extract_dino_features(self, renders_dir, mesh, car_id):
+        return camera_trellis, K, c2w
+
+    def project_dino_features_to_voxels(self, *, features, camera_intrinsics, camera_extrinsics, image_size, resolution=64):
+        """
+        Projects DINOv2 features to 3D voxel coordinates via raycasting.
+
+        Args:
+            features: (N_patches, D) numpy array of DINO features
+            camera_intrinsics: torch.Tensor [3, 3] intrinsics
+            camera_extrinsics: torch.Tensor [4, 4] world-from-camera matrix
+            image_size: int (assuming square image)
+            resolution: voxel grid resolution
+
+        Returns:
+            coords: voxel indices (N_valid, 3)
+            feats: corresponding features (N_valid, D)
+        """
+        K = camera_intrinsics.cpu().numpy()
+        c2w = np.linalg.inv(camera_extrinsics.cpu().numpy())  # Convert to world-from-camera
+
+        # 1. Determine patch grid shape (e.g., 14x14 for ViT-L/14 @ 518px → 37x37)
+        N = features.shape[0]
+
+        # Try to infer grid dimensions
+        possible_dims = []
+        for h in range(1, int(np.sqrt(N)) + 10):
+            if N % h == 0:
+                w = N // h
+                possible_dims.append((h, w))
+
+        # Choose the most square-like grid
+        grid_h, grid_w = min(possible_dims, key=lambda x: abs(x[0] - x[1]))
+
+        # Debug info
+        if grid_h * grid_w != N:
+            print(f"⚠️ Warning: Could not find perfect square grid. Using inferred {grid_h}x{grid_w} for {N} patches.")
+
+        # 2. Compute patch center pixels
+        patch_size = image_size / grid_w
+        xs = (np.arange(grid_w) + 0.5) * patch_size
+        ys = (np.arange(grid_h) + 0.5) * patch_size
+        px, py = np.meshgrid(xs, ys)
+        px = px.flatten()
+        py = py.flatten()
+
+        # 3. Convert pixels to rays in camera frame
+        fx = K[0, 0]
+        fy = K[1, 1]
+        cx = K[0, 2]
+        cy = K[1, 2]
+        x_cam = (px - cx) / fx
+        y_cam = (py - cy) / fy
+        rays_cam = np.stack([x_cam, y_cam, np.ones_like(x_cam)], axis=-1)  # (N, 3)
+        rays_cam /= np.linalg.norm(rays_cam, axis=-1, keepdims=True)
+
+        # 4. Transform rays to world space
+        R = c2w[:3, :3]
+        T = c2w[:3, 3]
+        rays_world = (R @ rays_cam.T).T  # (N, 3)
+        origin_world = T[None, :]        # (1, 3), broadcast
+
+        # 5. Sample a point along the ray (e.g., 1.5 units from camera origin)
+        depth = 1.5
+        points_3d = origin_world + rays_world * depth  # (N, 3)
+
+        # 6. Normalize points to voxel grid coordinates
+        coords = ((points_3d + 0.5) * resolution).astype(np.int32)  # Shift [-0.5, 0.5] to [0, 64]
+
+        # 7. Ensure consistent feature length
+        min_len = min(coords.shape[0], features.shape[0])
+        coords = coords[:min_len]
+        features = features[:min_len]
+
+        # 8. Clip to valid voxel grid bounds
+        mask = np.all((coords >= 0) & (coords < resolution), axis=1)
+        coords = coords[mask]
+        feats = features[mask]
+
+        return coords, feats
+
+    def extract_dino_features(self, renders_dir, mesh, car_id, sampled_camera_params):
         print("🔍 Extracting DINOv2 features for", car_id)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -265,10 +347,26 @@ class RealCar3DProcessor:
             with torch.no_grad():
                 feat = model.forward_features(tensor)  # [1, num_patches, 1024]
                 feat = feat.squeeze(0).cpu().numpy()  # shape (N_patches, 1024)
+                # print(f"DINOv2 feature shape: {feat.shape}")
 
-            # Dummy projection: randomly scatter into voxel grid (TEMP)
-            # Replace with raycasting/projection if accurate alignment is required
-            coords = np.random.randint(0, resolution, size=(feat.shape[0], 3))
+            # Get intrinsics and c2w from sampled_camera_params
+            idx = int(Path(path).stem.split("_")[-1])  # Extract frame index from filename
+            
+            if idx not in sampled_camera_params:
+                print(f"Warning: No camera parameters for frame {idx}, skipping")
+                continue
+                
+            K = sampled_camera_params[idx]['K']
+            c2w = sampled_camera_params[idx]['c2w']
+
+            # Project features
+            coords, feat = self.project_dino_features_to_voxels(
+                features=feat,
+                camera_intrinsics=torch.tensor(K),
+                camera_extrinsics=torch.tensor(c2w),
+                image_size=518,
+                resolution=64
+            )
 
             patchtokens_all.append(feat)
             indices_all.append(coords)
