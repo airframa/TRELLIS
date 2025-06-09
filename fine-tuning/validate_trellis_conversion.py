@@ -223,3 +223,5 @@ if __name__ == "__main__":
         preprocess_3drealcar(args.source_dir, args.output_dir)
     
     validate_trellis_format(args.source_dir, args.output_dir)
+
+
