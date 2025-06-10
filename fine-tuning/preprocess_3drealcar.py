@@ -439,63 +439,65 @@ class RealCar3DProcessor:
         num_frames = min(100, len(frame_paths))
         random_paths = random.sample(frame_paths, num_frames)
 
-        for path in tqdm(random_paths, desc="DINOv2 inference"):
-            image = Image.open(path).convert("RGB")
-            tensor = transform(image).unsqueeze(0).to(device)
+        with tqdm(random_paths, desc="DINOv2 inference", leave=False) as pbar:
+            for path in pbar:
+                image = Image.open(path).convert("RGB")
+                tensor = transform(image).unsqueeze(0).to(device)
 
-            with torch.no_grad():
-                feat = model.forward_features(tensor)
-                feat = feat.squeeze(0).cpu().numpy()
+                with torch.no_grad():
+                    feat = model.forward_features(tensor)
+                    feat = feat.squeeze(0).cpu().numpy()
 
-            idx = int(Path(path).stem.split("_")[-1])
-            
-            if idx not in sampled_camera_params:
-                print(f"Warning: No camera parameters for frame {idx}, skipping")
-                continue
+                idx = int(Path(path).stem.split("_")[-1])
                 
-            K_original = sampled_camera_params[idx]['K']
-            c2w = sampled_camera_params[idx]['c2w']
-            
-            # CRITICAL: Create adjusted intrinsics for 518x518 image
-            original_width = K_original[0, 2] * 2
-            original_height = K_original[1, 2] * 2
-            image_size = 518
-            
-            scale_x = image_size / original_width
-            scale_y = image_size / original_height
-            
-            K_adjusted = K_original.copy()
-            K_adjusted[0, 0] *= scale_x  # fx
-            K_adjusted[1, 1] *= scale_y  # fy
-            K_adjusted[0, 2] = image_size / 2  # cx
-            K_adjusted[1, 2] = image_size / 2  # cy
+                if idx not in sampled_camera_params:
+                    print(f"Warning: No camera parameters for frame {idx}, skipping")
+                    continue
+                    
+                K_original = sampled_camera_params[idx]['K']
+                c2w = sampled_camera_params[idx]['c2w']
+                
+                # CRITICAL: Create adjusted intrinsics for 518x518 image
+                original_width = K_original[0, 2] * 2
+                original_height = K_original[1, 2] * 2
+                image_size = 518
+                
+                scale_x = image_size / original_width
+                scale_y = image_size / original_height
+                
+                K_adjusted = K_original.copy()
+                K_adjusted[0, 0] *= scale_x  # fx
+                K_adjusted[1, 1] *= scale_y  # fy
+                K_adjusted[0, 2] = image_size / 2  # cx
+                K_adjusted[1, 2] = image_size / 2  # cy
 
-            # Project features with ADJUSTED intrinsics
-            coords, feat, debug_info = self.project_dino_features_to_voxels(
-                features=feat,
-                camera_intrinsics=torch.tensor(K_adjusted),  # Use adjusted K!
-                camera_extrinsics=torch.tensor(c2w),
-                image_size=518,
-                resolution=64,
-                return_debug=True,
-                mesh_bounds=mesh_bounds
-            )
+                # Project features with ADJUSTED intrinsics
+                coords, feat, debug_info = self.project_dino_features_to_voxels(
+                    features=feat,
+                    camera_intrinsics=torch.tensor(K_adjusted),  # Use adjusted K!
+                    camera_extrinsics=torch.tensor(c2w),
+                    image_size=518,
+                    resolution=64,
+                    return_debug=True,
+                    mesh_bounds=mesh_bounds
+                )
 
-            # Rest of the function remains the same...
-            total_valid_projections += len(coords)
-            total_out_of_bounds += debug_info['out_of_bounds']
-            
-            for coord in coords:
-                voxel_hit_count[coord[0], coord[1], coord[2]] += 1
+                # Rest of the function remains the same...
+                total_valid_projections += len(coords)
+                total_out_of_bounds += debug_info['out_of_bounds']
+                
+                for coord in coords:
+                    voxel_hit_count[coord[0], coord[1], coord[2]] += 1
 
-            patchtokens_all.append(feat)
-            indices_all.append(coords)
+                patchtokens_all.append(feat)
+                indices_all.append(coords)
 
         # Concatenate all results
         patchtokens = np.concatenate(patchtokens_all, axis=0)
         indices = np.concatenate(indices_all, axis=0)
 
         # Verification Report
+        print()  # Add explicit newline to separate from progress bar
         print("\n📊 Ray-casting Verification Report:")
         print(f"Total patches processed: {len(frame_paths[:10]) * 1374}")
         print(f"Valid projections: {total_valid_projections}")
@@ -1130,8 +1132,8 @@ def preprocess_3drealcar(source_dir, output_dir):
 
 if __name__ == "__main__":
     # Configuration - easily adjustable
-    SAMPLE_DATA_DIR = "./assets/3drealcar/sample-data"
-    OUTPUT_DIR = "./assets/3drealcar/sample-data-processed-trellis"
+    SAMPLE_DATA_DIR = "./assets/3drealcar/HQ200"
+    OUTPUT_DIR = "./assets/3drealcar/HQ200-processed-trellis"
     
     # Process all vehicles in the sample data directory
     preprocess_3drealcar(
