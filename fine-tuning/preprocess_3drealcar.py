@@ -193,17 +193,21 @@ class RealCar3DProcessor:
         # Add this new verification call
         self.verify_mesh_and_voxels(mesh, sha256, self.output_dir)
 
-        # Create metadata CSV entry
-        # Create metadata CSV entry - TRELLIS compatible format
+        # Create metadata CSV entry - Full TRELLIS compatibility
         metadata = {
-            'sha256': sha256,  # TRELLIS standard: content-based hash
-            'file_identifier': original_car_id,  # Keep original ID for reference
-            'num_voxels': len(voxel_info),
+            'sha256': sha256,
             'aesthetic_score': aesthetic_score,
             'rendered': True,
-            'voxelized': True,
+            'voxelized': True, 
+            'num_voxels': len(voxel_info),
             'num_views': len(transforms["frames"]),
-            'feature_dinov2_vitl14_reg': True
+            'feature_dinov2_vitl14_reg': True,
+            'cond_rendered': False,
+            'captions': None,
+            'local_path': str(mesh_file.relative_to(self.source_dir)),
+            # Custom fields for reference
+            'source_dataset': '3DRealCar',
+            'original_id': original_car_id,
         }
 
         print(f"Processed {len(transforms['frames'])} images for SHA256: {sha256}")
@@ -396,6 +400,13 @@ class RealCar3DProcessor:
     def extract_dino_features(self, renders_dir, mesh, sha256, sampled_camera_params):
         print("🔍 Extracting DINOv2 features for", sha256)
 
+        # Check if features already exist for this SHA256
+        feat_dir = self.output_dir / "features" / "dinov2_vitl14_reg"
+        feat_file = feat_dir / f"{sha256}.npz"
+        if feat_file.exists():
+            print(f"✅ Features already exist for SHA256: {sha256}, skipping extraction")
+            return
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Load DINOv2 reg4 (518px input size)
@@ -508,7 +519,7 @@ class RealCar3DProcessor:
         self._save_coverage_visualization(voxel_hit_count, renders_dir / "dino_coverage_debug.png")
 
         # Save features using SHA256 - TRELLIS standard
-        feat_dir = self.output_dir / "features" / "dinov2_vitl14_reg"
+        # feat_dir = self.output_dir / "features" / "dinov2_vitl14_reg"
         feat_dir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             feat_dir / f"{sha256}.npz",
@@ -1118,8 +1129,12 @@ def preprocess_3drealcar(source_dir, output_dir):
 
 
 if __name__ == "__main__":
-    # For testing with sample
+    # Configuration - easily adjustable
+    SAMPLE_DATA_DIR = "./assets/3drealcar/sample-data"
+    OUTPUT_DIR = "./assets/3drealcar/sample-data-processed-trellis"
+    
+    # Process all vehicles in the sample data directory
     preprocess_3drealcar(
-        source_dir="./assets/3drealcar/sample-data/2024_04_22_10_35_34",
-        output_dir="./assets/3drealcar/sample-data-processed-trellis"
+        source_dir=SAMPLE_DATA_DIR,
+        output_dir=OUTPUT_DIR
     )
