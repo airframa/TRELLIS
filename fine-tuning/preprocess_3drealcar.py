@@ -12,6 +12,12 @@ from torchvision import transforms
 from PIL import Image
 import glob
 from pathlib import Path
+# Add the TRELLIS root directory to sys.path
+import sys
+import os
+trellis_root = os.path.join(os.path.dirname(__file__), '..')
+sys.path.insert(0, trellis_root)
+from dataset_toolkits.utils import get_file_hash
 
 
 class RealCar3DProcessor:
@@ -29,29 +35,36 @@ class RealCar3DProcessor:
     def process_car(self, car_dir):
         """Process a single car from 3DRealCar to TRELLIS format"""
         car_dir = Path(car_dir)
-        car_id = car_dir.name
-
-        # Create directories in TRELLIS expected structure
-        renders_dir = self.output_dir / "renders" / car_id
-        renders_dir.mkdir(parents=True, exist_ok=True)
+        original_car_id = car_dir.name
 
         # Try different possible mesh locations
         mesh_candidates = [
             car_dir / "textured_output.obj",
-            car_dir / "export_refined.obj",
+            car_dir / "export_refined.obj", 
             car_dir / "export.obj",
             car_dir / "colmap_processed" / "meshed-delaunay.ply"
         ]
 
+        mesh_file = None
         mesh = None
         for mesh_path in mesh_candidates:
             if mesh_path.exists():
                 print(f"Loading mesh from: {mesh_path}")
                 mesh = trimesh.load(str(mesh_path), force='mesh')
+                mesh_file = mesh_path
                 break
 
-        if mesh is None:
+        if mesh is None or mesh_file is None:
             raise FileNotFoundError(f"No mesh file found in {car_dir}")
+
+        # Compute SHA256 hash of the mesh file - TRELLIS standard
+        sha256 = get_file_hash(str(mesh_file))
+        print(f"Computed SHA256 for {mesh_file.name}: {sha256}")
+        print(f"Original car ID: {original_car_id} -> SHA256: {sha256}")
+
+        # Create directories using SHA256 as identifier (TRELLIS standard)
+        renders_dir = self.output_dir / "renders" / sha256
+        renders_dir.mkdir(parents=True, exist_ok=True)
 
         # Normalize mesh to unit cube centered at origin
         # Store the transformation parameters
@@ -151,8 +164,8 @@ class RealCar3DProcessor:
         assert np.all(voxel_info >= 0) and np.all(voxel_info < 64), \
             f"Voxel coordinates out of bounds: min={voxel_info.min()}, max={voxel_info.max()}"
 
-        # Save voxel data as PLY in the root voxels directory
-        voxel_path = self.output_dir / "voxels" / f"{car_id}.ply"
+        # Save voxel data as PLY in the root voxels directory using SHA256
+        voxel_path = self.output_dir / "voxels" / f"{sha256}.ply"
 
         # Create PLY file with vertex positions
         with open(voxel_path, 'w') as f:
@@ -172,17 +185,19 @@ class RealCar3DProcessor:
         aesthetic_score = self.calculate_aesthetic_score(mesh, renders_dir)
 
         # Extract DINOv2 features (pass sampled_camera_params instead of frames_data)
-        self.extract_dino_features(renders_dir, mesh, car_id, sampled_camera_params)
+        self.extract_dino_features(renders_dir, mesh, sha256, sampled_camera_params)
 
         # Run additional verification about raycasting and reprojection
         self.verify_raycasting_reprojection(renders_dir, sampled_camera_params, mesh)
 
         # Add this new verification call
-        self.verify_mesh_and_voxels(mesh, car_id, self.output_dir)
+        self.verify_mesh_and_voxels(mesh, sha256, self.output_dir)
 
         # Create metadata CSV entry
+        # Create metadata CSV entry - TRELLIS compatible format
         metadata = {
-            'sha256': car_id,  # Using car_id as unique identifier
+            'sha256': sha256,  # TRELLIS standard: content-based hash
+            'file_identifier': original_car_id,  # Keep original ID for reference
             'num_voxels': len(voxel_info),
             'aesthetic_score': aesthetic_score,
             'rendered': True,
@@ -191,7 +206,9 @@ class RealCar3DProcessor:
             'feature_dinov2_vitl14_reg': True
         }
 
-        print(f"Processed {len(transforms['frames'])} images for {car_id}")
+        print(f"Processed {len(transforms['frames'])} images for SHA256: {sha256}")
+        print(f"Original ID: {original_car_id} -> SHA256: {sha256}")
+        
         return metadata
 
     def convert_camera_params(self, cam_3drealcar, mesh_scale, mesh_center, frame_num):
@@ -376,8 +393,8 @@ class RealCar3DProcessor:
 
         return coords, feats
 
-    def extract_dino_features(self, renders_dir, mesh, car_id, sampled_camera_params):
-        print("🔍 Extracting DINOv2 features for", car_id)
+    def extract_dino_features(self, renders_dir, mesh, sha256, sampled_camera_params):
+        print("🔍 Extracting DINOv2 features for", sha256)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -490,26 +507,18 @@ class RealCar3DProcessor:
         # Visualize coverage heatmap
         self._save_coverage_visualization(voxel_hit_count, renders_dir / "dino_coverage_debug.png")
 
-        # Save features
+        # Save features using SHA256 - TRELLIS standard
         feat_dir = self.output_dir / "features" / "dinov2_vitl14_reg"
         feat_dir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
-            feat_dir / f"{car_id}.npz",
+            feat_dir / f"{sha256}.npz",
             patchtokens=patchtokens.astype(np.float32),
             indices=indices.astype(np.int32)
         )
 
-        # Explicitly ensure file is written before returning
-        npz_path = feat_dir / f"{car_id}.npz"
-        import time
-        for _ in range(10):
-            if npz_path.exists():
-                break
-            time.sleep(0.1)  # Wait up to 1s if necessary
+        print(f"✅ Saved DINOv2 features to {feat_dir / f'{sha256}.npz'}")
 
-        print(f"✅ Saved DINOv2 features to {feat_dir / f'{car_id}.npz'}")
-
-    def verify_mesh_and_voxels(self, mesh, car_id, output_dir):
+    def verify_mesh_and_voxels(self, mesh, sha256, output_dir):
         """Verify mesh normalization and voxel alignment"""
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D
@@ -530,7 +539,7 @@ class RealCar3DProcessor:
         
         # Plot 2: Voxel representation
         ax2 = fig.add_subplot(132, projection='3d')
-        voxel_path = output_dir / "voxels" / f"{car_id}.ply"
+        voxel_path = output_dir / "voxels" / f"{sha256}.ply"
         if voxel_path.exists():
             # Read the PLY file manually
             voxel_coords = []
@@ -565,7 +574,7 @@ class RealCar3DProcessor:
         
         # Plot 3: Feature voxel locations
         ax3 = fig.add_subplot(133, projection='3d')
-        feat_path = output_dir / "features" / "dinov2_vitl14_reg" / f"{car_id}.npz"
+        feat_path = output_dir / "features" / "dinov2_vitl14_reg" / f"{sha256}.npz"
         if feat_path.exists():
             data = np.load(feat_path)
             indices = data['indices']
@@ -588,7 +597,7 @@ class RealCar3DProcessor:
         ax3.set_zlabel('Z')
         
         plt.tight_layout()
-        debug_path = output_dir / "renders" / car_id / "mesh_voxel_alignment_debug.png"
+        debug_path = output_dir / "renders" / sha256 / "mesh_voxel_alignment_debug.png"
         plt.savefig(debug_path, dpi=150)
         plt.close()
         print(f"💾 Saved mesh-voxel alignment debug to {debug_path}")
@@ -747,56 +756,56 @@ class RealCar3DProcessor:
             print("⚠️ WARNING: Low reprojection success rate indicates potential issues")
             
         # Debug visualization
-        fig, ax = plt.subplots(figsize=(10, 10))
-        # Load original resolution image
-        img = Image.open(renders_dir / "frame_00000.png")
-        ax.imshow(img)
+        # fig, ax = plt.subplots(figsize=(10, 10))
+        # # Load original resolution image
+        # img = Image.open(renders_dir / "frame_00000.png")
+        # ax.imshow(img)
         
-        # Calculate scaling factors
-        orig_width, orig_height = img.size
-        scale_x = orig_width / 518
-        scale_y = orig_height / 518
+        # # Calculate scaling factors
+        # orig_width, orig_height = img.size
+        # scale_x = orig_width / 518
+        # scale_y = orig_height / 518
         
-        # Plot reprojected voxels (scaled to original image size)
-        if np.sum(in_bounds) > 0:
-            scaled_points = points_img[in_bounds].copy()
-            scaled_points[:, 0] *= scale_x
-            scaled_points[:, 1] *= scale_y
-            ax.scatter(scaled_points[:, 0], scaled_points[:, 1], 
-                    c='red', s=1, alpha=0.5, label='Voxel centers')
+        # # Plot reprojected voxels (scaled to original image size)
+        # if np.sum(in_bounds) > 0:
+        #     scaled_points = points_img[in_bounds].copy()
+        #     scaled_points[:, 0] *= scale_x
+        #     scaled_points[:, 1] *= scale_y
+        #     ax.scatter(scaled_points[:, 0], scaled_points[:, 1], 
+        #             c='red', s=1, alpha=0.5, label='Voxel centers')
         
-        # Also plot the mesh center (scaled)
-        if p_cam[2] > 0:
-            scaled_p_img = p_img.copy()
-            scaled_p_img[0] *= scale_x
-            scaled_p_img[1] *= scale_y
-            ax.scatter(scaled_p_img[0], scaled_p_img[1], c='green', s=100, marker='o', label='Mesh center')
+        # # Also plot the mesh center (scaled)
+        # if p_cam[2] > 0:
+        #     scaled_p_img = p_img.copy()
+        #     scaled_p_img[0] *= scale_x
+        #     scaled_p_img[1] *= scale_y
+        #     ax.scatter(scaled_p_img[0], scaled_p_img[1], c='green', s=100, marker='o', label='Mesh center')
         
-        # Plot bounding box corners for reference
-        bounds = mesh.bounds
-        corners = []
-        for x in [bounds[0][0], bounds[1][0]]:
-            for y in [bounds[0][1], bounds[1][1]]:
-                for z in [bounds[0][2], bounds[1][2]]:
-                    corners.append([x, y, z, 1])
-        corners = np.array(corners)
+        # # Plot bounding box corners for reference
+        # bounds = mesh.bounds
+        # corners = []
+        # for x in [bounds[0][0], bounds[1][0]]:
+        #     for y in [bounds[0][1], bounds[1][1]]:
+        #         for z in [bounds[0][2], bounds[1][2]]:
+        #             corners.append([x, y, z, 1])
+        # corners = np.array(corners)
         
-        corners_cam = (w2c @ corners.T).T[:, :3]
-        corners_valid = corners_cam[corners_cam[:, 2] > 0]
-        if len(corners_valid) > 0:
-            corners_img = (K @ corners_valid.T).T
-            corners_img = corners_img[:, :2] / corners_img[:, 2:3]
-            ax.scatter(corners_img[:, 0], corners_img[:, 1], 
-                    c='blue', s=50, marker='x', label='BBox corners')
+        # corners_cam = (w2c @ corners.T).T[:, :3]
+        # corners_valid = corners_cam[corners_cam[:, 2] > 0]
+        # if len(corners_valid) > 0:
+        #     corners_img = (K @ corners_valid.T).T
+        #     corners_img = corners_img[:, :2] / corners_img[:, 2:3]
+        #     ax.scatter(corners_img[:, 0], corners_img[:, 1], 
+        #             c='blue', s=50, marker='x', label='BBox corners')
         
-        ax.set_xlim(0, 518)
-        ax.set_ylim(518, 0)  # Flip Y axis for image coordinates
-        ax.legend()
-        ax.set_title('Reprojection Debug - Camera 0')
+        # ax.set_xlim(0, 518)
+        # ax.set_ylim(518, 0)  # Flip Y axis for image coordinates
+        # ax.legend()
+        # ax.set_title('Reprojection Debug - Camera 0')
         
-        plt.savefig(renders_dir / "reprojection_debug.png", bbox_inches='tight', dpi=150)
-        plt.close()
-        print(f"💾 Saved detailed debug to {renders_dir / 'reprojection_debug.png'}")
+        # plt.savefig(renders_dir / "reprojection_debug.png", bbox_inches='tight', dpi=150)
+        # plt.close()
+        # print(f"💾 Saved detailed debug to {renders_dir / 'reprojection_debug.png'}")
         
         # Also save the simple reprojection visualization
         self._visualize_reprojection(renders_dir, points_img[in_bounds], "reprojection_check.png")
@@ -1096,12 +1105,16 @@ def preprocess_3drealcar(source_dir, output_dir):
                 traceback.print_exc()
                 continue
 
-    # Save metadata CSV
+    # Save metadata CSV in TRELLIS format
     if all_metadata:
         import pandas as pd
         df = pd.DataFrame(all_metadata)
-        df.to_csv(processor.output_dir / "metadata.csv", index=False)
-        print(f"Saved metadata for {len(all_metadata)} cars")
+        
+        # Save with SHA256 as index (TRELLIS standard)
+        df.set_index('sha256', inplace=True)
+        df.to_csv(processor.output_dir / "metadata.csv")
+        
+        print(f"✅ Saved TRELLIS-compatible metadata for {len(all_metadata)} cars")
 
 
 if __name__ == "__main__":
