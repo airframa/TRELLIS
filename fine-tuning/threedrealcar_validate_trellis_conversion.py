@@ -1,16 +1,11 @@
 import os
 import sys
 import json
-import numpy as np
-import torch
 from pathlib import Path
 import argparse
 
 # Add the parent directory to the Python path to find trellis
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Import the preprocessing module
-from preprocess_3drealcar import preprocess_3drealcar, RealCar3DProcessor
 
 # Now import required TRELLIS components
 from trellis.datasets import SparseStructure, SparseFeat2Render, SLat2Render
@@ -213,14 +208,9 @@ def validate_trellis_format(source_dir, output_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Validate 3DRealCar to TRELLIS format conversion")
     parser.add_argument("--source_dir", type=str, required=True, help="Source directory containing 3DRealCar data")
-    parser.add_argument("--output_dir", type=str, required=True, help="Output directory where TRELLIS format data was saved")
-    parser.add_argument("--process", action="store_true", help="Run preprocessing before validation")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory where TRELLIS format data was saved")    
     
     args = parser.parse_args()
-    
-    if args.process:
-        print("Running preprocessing...")
-        preprocess_3drealcar(args.source_dir, args.output_dir)
     
     validate_trellis_format(args.source_dir, args.output_dir)
 
