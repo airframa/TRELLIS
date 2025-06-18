@@ -1,4 +1,8 @@
-# Fixed preprocess_3drealcar.py with proper camera_angle_x handling
+# suppress TensorFlow INFO and WARNING logs
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # 0 = all logs, 1 = INFO, 2 = WARNING, 3 = ERRO
+# imports
+import argparse
 import json
 import random
 import numpy as np
@@ -6,25 +10,25 @@ import pandas as pd
 import cv2
 import trimesh
 import matplotlib.pyplot as plt
-from PIL import Image
 from tqdm import tqdm
 import torch
+import open_clip
 import timm
 from torchvision import transforms
 from PIL import Image
 import glob
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-import json
 import sys
-import os
 from numba import njit
 import subprocess
 # Add the TRELLIS root directory to sys.path
 trellis_root = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, trellis_root)
 from dataset_toolkits.utils import get_file_hash
-from threedrealcar_validate_trellis_conversion import validate_trellis_format
+from trellis.datasets import SparseStructure, SparseFeat2Render, SLat2Render
+
+
 
 
 # Numba-optimized version of project_dino_features_to_voxels
@@ -147,18 +151,55 @@ def ray_aabb_intersection_batch_numba(rays_world, origin_world, voxel_min, voxel
 
 
 class RealCar3DProcessor:
-    def __init__(self, source_dir, output_dir, sample_views=150):
+    def __init__(self, source_dir, output_dir, sample_views=150, run_verifications=False):
         self.source_dir = Path(source_dir)
         self.output_dir = Path(output_dir)
         self.sample_views = sample_views
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._run_verifications = run_verifications 
 
         # Create root-level directories as expected by TRELLIS
         (self.output_dir / "renders").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "voxels").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "features").mkdir(parents=True, exist_ok=True)
 
-    def process_car(self, car_dir):
+    def convert_to_trellis(self):
+        """Convert all cars in source directory to TRELLIS format"""
+        source_path = Path(self.source_dir)
+        all_metadata = []
+        
+        # Check if source_dir itself contains car data
+        if any(source_path.glob("frame_*.json")):
+            # Single car case
+            try:
+                metadata = self.execute_conversion(source_path)
+                all_metadata.append(metadata)
+            except Exception as e:
+                print(f"Error processing {source_path}: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            # Multiple cars case
+            car_dirs = []
+            for d in source_path.iterdir():
+                if d.is_dir() and any(d.glob("frame_*.json")):
+                    car_dirs.append(d)
+            
+            if car_dirs:
+                print(f"Found {len(car_dirs)} cars to process")
+                for car_dir in tqdm(car_dirs, desc="Converting to TRELLIS format", leave=False):
+                    try:
+                        metadata = self.execute_conversion(car_dir)
+                        all_metadata.append(metadata)
+                    except Exception as e:
+                        print(f"Error processing {car_dir.name}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+        
+        return all_metadata
+
+    def execute_conversion(self, car_dir):
         """Process a single car from 3DRealCar to TRELLIS format"""
         car_dir = Path(car_dir)
         original_car_id = car_dir.name
@@ -185,8 +226,6 @@ class RealCar3DProcessor:
 
         # Compute SHA256 hash of the mesh file - TRELLIS standard
         sha256 = get_file_hash(str(mesh_file))
-        # print(f"Computed SHA256 for {mesh_file.name}: {sha256}")
-        # print(f"Original car ID: {original_car_id} -> SHA256: {sha256}")
 
         # Create directories using SHA256 as identifier (TRELLIS standard)
         renders_dir = self.output_dir / "renders" / sha256
@@ -203,19 +242,6 @@ class RealCar3DProcessor:
         # Scale uniformly
         mesh.vertices /= max_extent
 
-        # Store the transformation parameters for later use
-        # mesh_center = mesh.vertices.mean(axis=0)  # Should be ~0 after centering
-        # mesh_scale = max_extent
-        
-        # Verify normalization
-        # print(f"Normalized mesh bounds: {mesh.bounds}")
-        # bbox_center = mesh.bounds.mean(axis=0)
-        # assert np.allclose(bbox_center, 0, atol=1e-6), f"Mesh bounding box not centered: {bbox_center}"
-        # mean_center = mesh.vertices.mean(axis=0)
-        # if not np.allclose(mean_center, 0, atol=1e-2):
-        #     print(f"⚠️ Mesh vertex mean is off-center: {mean_center} (expected ~0)")
-        # assert np.max(np.abs(mesh.vertices)) <= 0.5 + 1e-6, "Mesh not properly scaled"
-
         # Save the mesh in the expected location
         mesh_output_path = renders_dir / "mesh.ply"
         mesh.export(str(mesh_output_path))
@@ -226,18 +252,11 @@ class RealCar3DProcessor:
         if not frames_data:
             raise ValueError(f"No frame data found in {car_dir}")
 
-        # print(f"Found {len(frames_data)} valid frames")
-
         # Sample views uniformly
         sampled_indices = self.sample_uniform_views(len(frames_data), target=min(self.sample_views, len(frames_data)))
 
-        # Prepare transforms.json for TRELLIS format
-        # transforms = {
-        #     "frames": []
-        # }
-
         # Path to your output JSON file
-        transforms_path = self.output_dir / "transforms.json"
+        transforms_path = renders_dir / "transforms.json"
 
         # Load existing transforms if available
         if transforms_path.exists():
@@ -283,12 +302,18 @@ class RealCar3DProcessor:
                 frame_data['frame_num']
             )
             
-            # Add frame to transforms (only transform_matrix goes in frames)
-            transforms["frames"].append({
+            # Add frame to transforms with intrinsics
+            frame_info = {
                 "file_path": f"./{output_image_name}",
                 "transform_matrix": cam_trellis['transform_matrix'],
                 "camera_angle_x": cam_trellis['camera_angle_x']
-            })
+            }
+            
+            # Add original intrinsics if available
+            if K is not None:
+                frame_info["intrinsics"] = K.tolist()
+            
+            transforms["frames"].append(frame_info)
 
             # Store camera parameters for DINOv2 processing
             sampled_camera_params[idx] = {
@@ -328,15 +353,6 @@ class RealCar3DProcessor:
         # Calculate aesthetic score
         aesthetic_score = self.calculate_aesthetic_score(mesh, renders_dir)
 
-        # Extract DINOv2 features (pass sampled_camera_params instead of frames_data)
-        self.extract_dino_features(renders_dir, mesh, sha256, sampled_camera_params)
-
-        # # Run additional verification about raycasting and reprojection
-        # self.verify_raycasting_reprojection(renders_dir, sampled_camera_params, mesh)
-
-        # # # Add this new verification call
-        # self.verify_mesh_and_voxels(mesh, sha256, self.output_dir)
-
         # Create metadata CSV entry - Full TRELLIS compatibility
         metadata = {
             'sha256': sha256,
@@ -345,7 +361,8 @@ class RealCar3DProcessor:
             'voxelized': True, 
             'num_voxels': len(voxel_info),
             'num_views': len(transforms["frames"]),
-            'feature_dinov2_vitl14_reg': True,
+            'feature_dinov2_vitl14_reg': False,  # Changed to False
+            'latent_dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16': False,  # Added
             'cond_rendered': False,
             'captions': None,
             'local_path': str(mesh_file.relative_to(self.source_dir)),
@@ -353,9 +370,6 @@ class RealCar3DProcessor:
             'source_dataset': '3DRealCar',
             'original_id': original_car_id,
         }
-
-        # print(f"Processed {len(transforms['frames'])} images for SHA256: {sha256}")
-        # print(f"Original ID: {original_car_id} -> SHA256: {sha256}")
         
         return metadata
 
@@ -422,124 +436,6 @@ class RealCar3DProcessor:
             camera_trellis['transform_matrix'] = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
 
         return camera_trellis, K, c2w
-
-    def project_dino_features_to_voxels(self, *, features, camera_intrinsics, camera_extrinsics, image_size, resolution=64, return_debug=False, mesh_bounds=None):
-        """
-        Projects DINOv2 features to 3D voxel coordinates via raycasting.
-        """
-        K = camera_intrinsics.cpu().numpy()  # Already adjusted!
-        c2w_input = camera_extrinsics.cpu().numpy()
-        c2w = c2w_input
-        
-        # 1. Determine patch grid shape
-        N = features.shape[0]
-        possible_dims = []
-        for h in range(1, int(np.sqrt(N)) + 10):
-            if N % h == 0:
-                w = N // h
-                possible_dims.append((h, w))
-        grid_h, grid_w = min(possible_dims, key=lambda x: abs(x[0] - x[1]))
-
-        # 2. Compute patch center pixels
-        # Fix grid calculation - DINOv2 always outputs 37x37 grid for 518x518 images
-        patch_size = 14
-        grid_w = image_size // patch_size  # 37
-        grid_h = image_size // patch_size  # 37
-        
-        # Handle token count mismatch
-        expected_tokens = grid_h * grid_w
-        if features.shape[0] != expected_tokens:
-            features = features[:expected_tokens]  # Truncate extra tokens
-        
-        # Compute patch centers
-        xs = (np.arange(grid_w) + 0.5) * patch_size
-        ys = (np.arange(grid_h) + 0.5) * patch_size
-        px, py = np.meshgrid(xs, ys)
-        px = px.flatten()
-        py = py.flatten()
-
-        # 3. Convert pixels to rays in camera frame
-        fx = K[0, 0]
-        fy = K[1, 1]
-        cx = K[0, 2]
-        cy = K[1, 2]
-        
-        x_cam = (px - cx) / fx
-        y_cam = (py - cy) / fy
-        rays_cam = np.stack([x_cam, y_cam, np.ones_like(x_cam)], axis=-1)
-        rays_cam /= np.linalg.norm(rays_cam, axis=-1, keepdims=True)
-
-        # 4. Transform rays to world space
-        R = c2w[:3, :3]
-        T = c2w[:3, 3]
-        rays_world = (R @ rays_cam.T).T
-        origin_world = T[None, :]
-
-        # 5. Ray-mesh intersection approach
-        # Instead of fixed depth, we'll cast rays through the voxel volume
-        # and sample points along the ray that fall within the mesh bounds
-        
-        if mesh_bounds is not None:
-            # Use actual mesh bounds (should be close to [-0.5, 0.5]^3 after normalization)
-            voxel_min = mesh_bounds[0]
-            voxel_max = mesh_bounds[1]
-        else:
-            # Default normalized bounds
-            voxel_min = np.array([-0.5, -0.5, -0.5])
-            voxel_max = np.array([0.5, 0.5, 0.5])
-        
-        # Find ray-box intersections for each ray
-        valid_coords = []
-        valid_feats = []
-        
-        for i in range(len(rays_world)):
-            ray_origin = origin_world[0]
-            ray_dir = rays_world[i]
-            
-            # Ray-AABB intersection
-            t_min = (voxel_min - ray_origin) / (ray_dir + 1e-8)
-            t_max = (voxel_max - ray_origin) / (ray_dir + 1e-8)
-            
-            t_enter = np.maximum(np.minimum(t_min, t_max), 0)
-            t_exit = np.maximum(t_min, t_max)
-            
-            t_near = np.max(t_enter)
-            t_far = np.min(t_exit)
-            
-            if t_near < t_far and t_far > 0:
-                # Ray intersects the voxel volume
-                # Sample a point in the middle of the intersection
-                t_sample = (t_near + t_far) * 0.5
-                point_3d = ray_origin + ray_dir * t_sample
-                
-                # Convert to voxel coordinates
-                voxel_coord = ((point_3d - voxel_min) / (voxel_max - voxel_min) * resolution).astype(np.int32)
-                
-                # Double-check bounds
-                if np.all(voxel_coord >= 0) and np.all(voxel_coord < resolution):
-                    valid_coords.append(voxel_coord)
-                    valid_feats.append(features[i])
-        
-        if len(valid_coords) > 0:
-            coords = np.array(valid_coords)
-            feats = np.array(valid_feats)
-        else:
-            coords = np.array([]).reshape(0, 3).astype(np.int32)
-            feats = np.array([]).reshape(0, features.shape[1])
-        
-        if return_debug:
-            debug_info = {
-                'out_of_bounds': N - len(coords),
-                'grid_shape': (grid_h, grid_w),
-                'patch_size': patch_size,
-                'camera_position': T,
-                'total_patches': N,
-                'valid_patches': len(coords),
-                'mesh_bounds': (voxel_min, voxel_max)
-            }
-            return coords, feats, debug_info
-
-        return coords, feats
     
     def project_dino_features_to_voxels_optimized(self, *, features, camera_intrinsics, camera_extrinsics, 
                                             image_size, resolution=64, return_debug=False, mesh_bounds=None):
@@ -610,65 +506,121 @@ class RealCar3DProcessor:
 
         return coords, feats
 
-    def extract_dino_features(self, renders_dir, mesh, sha256, sampled_camera_params):
-        # print("🔍 Extracting DINOv2 features for", sha256)
-
-        # Check if features already exist for this SHA256
-        feat_dir = self.output_dir / "features" / "dinov2_vitl14_reg"
-        feat_file = feat_dir / f"{sha256}.npz"
-        if feat_file.exists():
-            print(f"✅ Features already exist for SHA256: {sha256}, skipping extraction")
+    def extract_dino_features_all(self):
+        """Extract DINOv2 features for all cars in the dataset efficiently"""
+        print("🔍 Extracting DINOv2 features for all cars...")
+        
+        metadata_path = self.output_dir / "metadata.csv"
+        if not metadata_path.exists():
+            print("No metadata.csv found. Run execute_conversion first.")
             return
-
+            
+        df = pd.read_csv(metadata_path)
+        
+        # Load DINOv2 model only once
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Load DINOv2 reg4 (518px input size)
+        print(f"Loading DINOv2 model on {device}...")
+        
         model = timm.create_model("vit_large_patch14_reg4_dinov2.lvd142m", pretrained=True)
         model.eval().to(device)
-
+        
         transform = transforms.Compose([
             transforms.Resize((518, 518)),
             transforms.ToTensor(),
             transforms.Normalize([0.5]*3, [0.5]*3)
         ])
+        
+        # Process each car
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Extracting DINOv2 features", leave=False):
+            sha256 = row['sha256']
+            
+            # Check if features already exist
+            feat_dir = self.output_dir / "features" / "dinov2_vitl14_reg"
+            feat_file = feat_dir / f"{sha256}.npz"
+            if feat_file.exists():
+                print(f"DINOv2 features already exist. Skipping extraction.")
+                continue
+                
+            try:
+                self._extract_features_for_car(
+                    sha256=sha256,
+                    model=model,
+                    transform=transform,
+                    device=device
+                )
+            except Exception as e:
+                print(f"❌ Error processing {sha256}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        print("✅ DINOv2 feature extraction complete!")
 
-        frame_paths = sorted(glob.glob(str(renders_dir / "frame_*.png")))
-        if not frame_paths:
-            print(f"⚠️ No rendered frames found in {renders_dir}")
-            return
-
+    def _extract_features_for_car(self, sha256, model, transform, device):
+        """Extract features for a single car"""
+        renders_dir = self.output_dir / "renders" / sha256
+        
+        # Load mesh
+        mesh_path = renders_dir / "mesh.ply"
+        if not mesh_path.exists():
+            raise FileNotFoundError(f"Mesh not found: {mesh_path}")
+        mesh = trimesh.load(str(mesh_path), process=False)
+        mesh_bounds = mesh.bounds
+        
+        # Load transforms.json to get camera info
+        transforms_path = renders_dir / "transforms.json"
+        if not transforms_path.exists():
+            raise FileNotFoundError(f"transforms.json not found: {transforms_path}")
+            
+        with open(transforms_path, 'r') as f:
+            transforms_data = json.load(f)
+        
+        # Get all frame files
+        frame_files = sorted(renders_dir.glob("frame_*.png"))
+        if not frame_files:
+            raise FileNotFoundError(f"No frame files found in {renders_dir}")
+        
+        # Create frame path to transforms mapping
+        frame_to_transform = {}
+        for i, frame_info in enumerate(transforms_data['frames']):
+            filename = Path(frame_info['file_path']).name
+            frame_to_transform[filename] = {
+                'transform_matrix': np.array(frame_info['transform_matrix']),
+                'camera_angle_x': frame_info.get('camera_angle_x', 1.0),
+                'intrinsics': np.array(frame_info['intrinsics']) if 'intrinsics' in frame_info else None,
+                'index': i
+            }
+        
+        # Sample frames for feature extraction
+        num_frames_to_sample = min(100, len(frame_files))
+        if len(frame_files) > num_frames_to_sample:
+            sampled_frames = random.sample(frame_files, num_frames_to_sample)
+        else:
+            sampled_frames = frame_files
+        
+        # Extract features
         patchtokens_all = []
         indices_all = []
-
         resolution = 64
-        mesh_bounds = mesh.bounds
-        # print(f"Mesh bounds: min={mesh_bounds[0]}, max={mesh_bounds[1]}")
-
-        # Verification: Track feature coverage
+        
+        # Verification tracking
         voxel_hit_count = np.zeros((resolution, resolution, resolution), dtype=int)
         total_valid_projections = 0
         total_out_of_bounds = 0
-
-        num_frames = min(100, len(frame_paths))
-        random_paths = random.sample(frame_paths, num_frames)
-
-        with tqdm(random_paths, desc="DINOv2 inference", leave=True) as pbar:
-            for path in pbar:
-                image = Image.open(path).convert("RGB")
-                tensor = transform(image).unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    feat = model.forward_features(tensor)
-                    feat = feat.squeeze(0).cpu().numpy()
-
-                idx = int(Path(path).stem.split("_")[-1])
+        
+        for frame_path in tqdm(sampled_frames, desc=f"Extracting features for {sha256[:8]}...", leave=False):
+            frame_name = frame_path.name
+            
+            if frame_name not in frame_to_transform:
+                continue
                 
-                if idx not in sampled_camera_params:
-                    print(f"Warning: No camera parameters for frame {idx}, skipping")
-                    continue
-                    
-                K_original = sampled_camera_params[idx]['K']
-                c2w = sampled_camera_params[idx]['c2w']
+            # Get camera info
+            cam_info = frame_to_transform[frame_name]
+            c2w = cam_info['transform_matrix']
+            
+            # Use original intrinsics if available, otherwise reconstruct from FOV
+            if cam_info['intrinsics'] is not None:
+                K_original = cam_info['intrinsics']
                 
                 # CRITICAL: Create adjusted intrinsics for 518x518 image
                 original_width = K_original[0, 2] * 2
@@ -678,71 +630,123 @@ class RealCar3DProcessor:
                 scale_x = image_size / original_width
                 scale_y = image_size / original_height
                 
-                K_adjusted = K_original.copy()
-                K_adjusted[0, 0] *= scale_x  # fx
-                K_adjusted[1, 1] *= scale_y  # fy
-                K_adjusted[0, 2] = image_size / 2  # cx
-                K_adjusted[1, 2] = image_size / 2  # cy
-
-                # Project features with ADJUSTED intrinsics
-                coords, feat, debug_info = self.project_dino_features_to_voxels_optimized(
-                    features=feat,
-                    camera_intrinsics=torch.tensor(K_adjusted),  # Use adjusted K!
-                    camera_extrinsics=torch.tensor(c2w),
-                    image_size=518,
-                    resolution=64,
-                    return_debug=True,
-                    mesh_bounds=mesh_bounds
-                )
-
-                # Rest of the function remains the same...
-                total_valid_projections += len(coords)
-                total_out_of_bounds += debug_info['out_of_bounds']
+                K = K_original.copy()
+                K[0, 0] *= scale_x  # fx
+                K[1, 1] *= scale_y  # fy
+                K[0, 2] = image_size / 2  # cx
+                K[1, 2] = image_size / 2  # cy
+            else:
+                # Fallback: reconstruct from FOV
+                camera_angle_x = cam_info['camera_angle_x']
+                image_size = 518
+                fx = image_size / (2 * np.tan(camera_angle_x / 2))
+                fy = fx  # Assume square pixels
+                cx = cy = image_size / 2
                 
-                for coord in coords:
-                    voxel_hit_count[coord[0], coord[1], coord[2]] += 1
-
-                patchtokens_all.append(feat)
+                K = np.array([
+                    [fx, 0, cx],
+                    [0, fy, cy],
+                    [0, 0, 1]
+                ])
+            
+            # Load and process image
+            image = Image.open(frame_path).convert("RGB")
+            tensor = transform(image).unsqueeze(0).to(device)
+            
+            # Extract features
+            with torch.no_grad():
+                features = model.forward_features(tensor)
+                features = features.squeeze(0).cpu().numpy()
+            
+            # Project features to voxels with debug info
+            coords, feats, debug_info = self.project_dino_features_to_voxels_optimized(
+                features=features,
+                camera_intrinsics=torch.tensor(K),
+                camera_extrinsics=torch.tensor(c2w),
+                image_size=518,
+                resolution=resolution,
+                mesh_bounds=mesh_bounds,
+                return_debug=True
+            )
+            
+            # Update verification tracking
+            total_valid_projections += len(coords)
+            total_out_of_bounds += debug_info['out_of_bounds']
+            
+            for coord in coords:
+                voxel_hit_count[coord[0], coord[1], coord[2]] += 1
+            
+            if len(coords) > 0:
+                patchtokens_all.append(feats)
                 indices_all.append(coords)
-
-        # Concatenate all results
-        patchtokens = np.concatenate(patchtokens_all, axis=0)
-        indices = np.concatenate(indices_all, axis=0)
-
-        # Verification Report
-        # print()  # Add explicit newline to separate from progress bar
-        # print("\n📊 Ray-casting Verification Report:")
-        # print(f"Total patches processed: {len(frame_paths[:10]) * 1374}")
-        # print(f"Valid projections: {total_valid_projections}")
-        # print(f"Out of bounds projections: {total_out_of_bounds}")
-        # print(f"Projection success rate: {total_valid_projections / (total_valid_projections + total_out_of_bounds) * 100:.1f}%")
         
-        # unique_voxels_hit = np.sum(voxel_hit_count > 0)
-        # print(f"Unique voxels with features: {unique_voxels_hit}")
-        # print(f"Voxel coverage: {unique_voxels_hit / (resolution**3) * 100:.3f}%")  # Show 3 decimal places
+        # Save features if we have any
+        if patchtokens_all and indices_all:
+            patchtokens = np.concatenate(patchtokens_all, axis=0)
+            indices = np.concatenate(indices_all, axis=0)
+            
+            # Save features
+            feat_dir = self.output_dir / "features" / "dinov2_vitl14_reg"
+            feat_dir.mkdir(parents=True, exist_ok=True)
+            
+            np.savez_compressed(
+                feat_dir / f"{sha256}.npz",
+                patchtokens=patchtokens.astype(np.float32),
+                indices=indices.astype(np.int32)
+            )
+            
+            # print(f"✓ Saved {len(indices)} features for {sha256[:8]}...")
         
-        # # Check spatial distribution
-        # x_coverage = np.any(voxel_hit_count > 0, axis=(1, 2))
-        # y_coverage = np.any(voxel_hit_count > 0, axis=(0, 2))
-        # z_coverage = np.any(voxel_hit_count > 0, axis=(0, 1))
-        
-        # print(f"X-axis coverage: {np.sum(x_coverage)}/{resolution} slices")
-        # print(f"Y-axis coverage: {np.sum(y_coverage)}/{resolution} slices")
-        # print(f"Z-axis coverage: {np.sum(z_coverage)}/{resolution} slices")
-        
-        # # Visualize coverage heatmap
-        # self._save_coverage_visualization(voxel_hit_count, renders_dir / "dino_coverage_debug.png")
+            # Quick verification calls
+            if self._run_verifications: 
 
-        # Save features using SHA256 - TRELLIS standard
-        # feat_dir = self.output_dir / "features" / "dinov2_vitl14_reg"
-        feat_dir.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            feat_dir / f"{sha256}.npz",
-            patchtokens=patchtokens.astype(np.float32),
-            indices=indices.astype(np.int32)
-        )
+                # Print verification report
+                print(f"\n📊 Ray-casting Verification Report for {sha256[:8]}:")
+                # Use first 10 frames for consistency with original report
+                num_frames_for_report = min(10, len(sampled_frames))
+                total_patches = num_frames_for_report * 1374  # Correct number: 1374 patches
+                print(f"Total patches processed: {total_patches}")
+                print(f"Valid projections: {total_valid_projections}")
+                print(f"Out of bounds projections: {total_out_of_bounds}")
 
-        # print(f"✅ Saved DINOv2 features to {feat_dir / f'{sha256}.npz'}")
+                if (total_valid_projections + total_out_of_bounds) > 0:
+                    success_rate = total_valid_projections / (total_valid_projections + total_out_of_bounds) * 100
+                    print(f"Projection success rate: {success_rate:.1f}%")
+                else:
+                    print("Projection success rate: N/A (no projections)")
+
+                unique_voxels_hit = np.sum(voxel_hit_count > 0)
+                print(f"Unique voxels with features: {unique_voxels_hit}")
+                print(f"Voxel coverage: {unique_voxels_hit / (resolution**3) * 100:.3f}%")  # Show 3 decimal places
+
+                # Check spatial distribution
+                x_coverage = np.any(voxel_hit_count > 0, axis=(1, 2))
+                y_coverage = np.any(voxel_hit_count > 0, axis=(0, 2))
+                z_coverage = np.any(voxel_hit_count > 0, axis=(0, 1))
+
+                print(f"X-axis coverage: {np.sum(x_coverage)}/{resolution} slices")
+                print(f"Y-axis coverage: {np.sum(y_coverage)}/{resolution} slices")
+                print(f"Z-axis coverage: {np.sum(z_coverage)}/{resolution} slices")
+                
+                # Optionally save visualization
+                if unique_voxels_hit > 0:
+                    self._save_coverage_visualization(voxel_hit_count, renders_dir / "dino_coverage_debug.png")
+
+                # Reconstruct sampled_camera_params for verification
+                sampled_camera_params = {}
+                for i, (fname, cam_info) in enumerate(frame_to_transform.items()):
+                    if cam_info['intrinsics'] is not None:
+                        sampled_camera_params[i] = {
+                            'K': cam_info['intrinsics'],
+                            'c2w': cam_info['transform_matrix'],
+                            'original_frame_idx': i
+                        }
+                
+                print("\n🔍 Running additional verifications...")
+                self.verify_raycasting_reprojection(renders_dir, sampled_camera_params, mesh)
+                self.verify_mesh_and_voxels(mesh, sha256, self.output_dir)
+        else:
+            print(f"⚠️ No valid features extracted for {sha256}")
 
     def verify_mesh_and_voxels(self, mesh, sha256, output_dir):
         """Verify mesh normalization and voxel alignment"""
@@ -862,7 +866,6 @@ class RealCar3DProcessor:
         plt.savefig(output_path, dpi=150)
         plt.close()
         print(f"💾 Saved coverage visualization to {output_path}")
-
 
     def verify_raycasting_reprojection(self, renders_dir, sampled_camera_params, mesh):
         """Verify that voxels projected from camera 0 can be reprojected back correctly"""
@@ -984,7 +987,6 @@ class RealCar3DProcessor:
         # Also save the simple reprojection visualization
         self._visualize_reprojection(renders_dir, points_img[in_bounds], "reprojection_check.png")
 
-
     def _visualize_reprojection(self, renders_dir, points_2d, filename):
         # Load first frame (original resolution)
         first_frame = renders_dir / "frame_00000.png"
@@ -1011,7 +1013,6 @@ class RealCar3DProcessor:
         plt.savefig(output_path, bbox_inches='tight', dpi=150)
         plt.close()
         print(f"💾 Saved reprojection visualization to {output_path}")
-
 
     def load_frames_data(self, car_dir):
         """Load all frame data (images and camera parameters) in parallel"""
@@ -1067,19 +1068,12 @@ class RealCar3DProcessor:
 
         return frames_data
 
-
     def calculate_aesthetic_score(self, mesh, renders_dir):
         """
         Calculate aesthetic score using LAION aesthetic predictor.
         Randomly samples frames and averages their scores.
         """
         try:
-            import torch
-            import open_clip
-            from PIL import Image
-            import random
-            import glob
-
             # Check if we have the required model files
             weights_path = "third_party/improved_aesthetic_predictor/sac+logos+ava1-l14-linearMSE.pth"
             if not Path(weights_path).exists():
@@ -1246,6 +1240,7 @@ class RealCar3DProcessor:
         # General check: if any .npz file exists, assume latents are done
         if latent_dir.exists() and any(latent_dir.glob("*.npz")) and not force:
             print("Latent features already exist. Skipping encoding.")
+            print("✅ Latent features encoding complete!")
             return
         
         cmd = [
@@ -1256,8 +1251,8 @@ class RealCar3DProcessor:
         ]
 
         # Optional: print the command for debug
-        print("Running encode_latents command:")
-        print(" ".join(cmd))
+        print("🔍 Encoding latent features for all cars")
+        # print(" ".join(cmd))
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -1269,64 +1264,109 @@ class RealCar3DProcessor:
             print("encode_latents completed successfully.")
             print(result.stdout)
 
-    def update_metadata_with_latents(self):
+        print("✅ Latent features encoding complete!")
+
+    def update_metadata(self, update_type, check_dir=None, column_name=None, print_summary=False):
         """
-        Updates metadata.csv in self.output_dir with latent encoding information.
+        General metadata update function.
+        
+        Args:
+            update_type: Type of update ('features' or 'latents')
+            check_dir: Directory to check for files (optional)
+            column_name: Specific column to update (optional)
         """
-        dataset_dir = self.output_dir
-        metadata_path = dataset_dir / "metadata.csv"
-        print(f"Reading metadata from: {metadata_path}")
-        df_metadata = pd.read_csv(metadata_path)
+        def _log(msg):
+            if print_summary:
+                _log(msg)
 
-        # Find all latent CSV files
-        latent_csv_files = list(dataset_dir.glob("latent_*.csv"))
-        print(f"Found {len(latent_csv_files)} latent CSV files")
-
-        for latent_csv in latent_csv_files:
-            print(f"\nProcessing: {latent_csv.name}")
-            latent_col_name = latent_csv.stem.rsplit('_', 1)[0]
-
-            df_latent = pd.read_csv(latent_csv)
-
-            if latent_col_name not in df_metadata.columns:
-                df_metadata[latent_col_name] = False
-
-            for _, row in df_latent.iterrows():
+        metadata_path = self.output_dir / "metadata.csv"
+        
+        if not metadata_path.exists():
+            print(f"Warning: metadata.csv not found at {metadata_path}")
+            return
+            
+        df = pd.read_csv(metadata_path)
+        
+        if update_type == 'features':
+            # Update DINOv2 features
+            if check_dir is None:
+                check_dir = self.output_dir / "features" / "dinov2_vitl14_reg"
+            if column_name is None:
+                column_name = 'feature_dinov2_vitl14_reg'
+                
+            _log(f"Updating {column_name} in metadata...")
+            updated_count = 0
+            
+            for idx, row in df.iterrows():
                 sha256 = row['sha256']
-                has_latent = row[latent_col_name]
-                mask = df_metadata['sha256'] == sha256
-                if mask.any():
-                    df_metadata.loc[mask, latent_col_name] = has_latent
-                    print(f"  Updated {sha256}: {latent_col_name} = {has_latent}")
+                feat_file = check_dir / f"{sha256}.npz"
+                if feat_file.exists():
+                    df.loc[idx, column_name] = True
+                    updated_count += 1
                 else:
-                    print(f"  WARNING: SHA256 {sha256} not found in metadata!")
+                    df.loc[idx, column_name] = False
+                    
+            _log(f"Updated {updated_count} entries with {column_name}=True")
+            
+        elif update_type == 'latents':
+            # Update latent encodings from CSV files
+            latent_csv_files = list(self.output_dir.glob("latent_*.csv"))
+            _log(f"Found {len(latent_csv_files)} latent CSV files")
+            
+            for latent_csv in latent_csv_files:
+                _log(f"Processing: {latent_csv.name}")
+                latent_col_name = latent_csv.stem.rsplit('_', 1)[0]
+                
+                df_latent = pd.read_csv(latent_csv)
+                
+                if latent_col_name not in df.columns:
+                    df[latent_col_name] = False
+                    
+                for _, latent_row in df_latent.iterrows():
+                    sha256 = latent_row['sha256']
+                    has_latent = latent_row[latent_col_name]
+                    mask = df['sha256'] == sha256
+                    if mask.any():
+                        df.loc[mask, latent_col_name] = has_latent
+                        
+            # Verify latent files exist
+            self._verify_latent_files(df)
+        
+        # Save updated metadata
+        df.to_csv(metadata_path, index=False)
+        print(f"✅ Updated metadata saved to: {metadata_path}")
+        
+        # Print summary
+        if print_summary:
+            self._print_metadata_summary(df)
 
-        # Verify latent files exist
-        print("\nVerifying latent files...")
-        latent_cols = [col for col in df_metadata.columns if col.startswith('latent_')]
-
+    def _verify_latent_files(self, df):
+        """Helper method to verify latent files exist"""
+        latent_cols = [col for col in df.columns if col.startswith('latent_')]
+        
         for latent_col in latent_cols:
+            # Parse column name to get directory structure
             parts = latent_col.replace('latent_', '').split('_')
             feat_model_parts = []
             enc_model_parts = []
             found_enc = False
-
+            
             for i, part in enumerate(parts):
                 if 'enc' in part and not found_enc:
                     found_enc = True
                     enc_model_parts = parts[i:]
                 elif not found_enc:
                     feat_model_parts.append(part)
-
+                    
             feat_model = '_'.join(feat_model_parts)
             enc_model = '_'.join(enc_model_parts)
-
-            latent_dir = dataset_dir / "latents" / f"{feat_model}_{enc_model}"
+            
+            latent_dir = self.output_dir / "latents" / f"{feat_model}_{enc_model}"
             if latent_dir.exists():
-                print(f"\nChecking {latent_col} in {latent_dir.name}...")
+                # print(f"\nVerifying {latent_col} files in {latent_dir.name}...")
                 verified_count = 0
-
-                for idx, row in df_metadata.iterrows():
+                
+                for idx, row in df.iterrows():
                     if row.get(latent_col, False):
                         sha256 = row['sha256']
                         latent_file = latent_dir / f"{sha256}.npz"
@@ -1334,112 +1374,275 @@ class RealCar3DProcessor:
                             verified_count += 1
                         else:
                             print(f"  WARNING: Missing latent file for {sha256}")
-                            df_metadata.loc[idx, latent_col] = False
-                print(f"  Verified {verified_count} latent files exist")
+                            df.loc[idx, latent_col] = False
+                # print(f"  Verified {verified_count} latent files exist")
 
-        df_metadata.to_csv(metadata_path, index=False)
-        print(f"\n✅ Updated metadata saved to: {metadata_path}")
-
-        # Print summary
+    def _print_metadata_summary(self, df):
+        """Helper method to print metadata summary"""
         print("\n📊 Metadata Summary:")
-        print(f"Total instances: {len(df_metadata)}")
-        for col in df_metadata.columns:
-            if col.startswith('latent_'):
-                count = df_metadata[col].sum()
+        print(f"Total instances: {len(df)}")
+        
+        # Latent columns
+        for col in df.columns:
+            if col.startswith('latent_') or col.startswith('feature_'):
+                count = df[col].sum()
                 print(f"  {col}: {count} instances")
-
-        trellis_cols = ['rendered', 'voxelized', 'feature_dinov2_vitl14_reg', 'aesthetic_score']
+        
+        # TRELLIS standard columns
+        trellis_cols = ['rendered', 'voxelized', 'aesthetic_score']
         for col in trellis_cols:
-            if col in df_metadata.columns:
+            if col in df.columns:
                 if col == 'aesthetic_score':
-                    mean_score = df_metadata[col].mean()
+                    mean_score = df[col].mean()
                     print(f"  {col}: mean = {mean_score:.2f}")
                 else:
-                    count = df_metadata[col].sum() if df_metadata[col].dtype == bool else df_metadata[col].notna().sum()
+                    count = df[col].sum() if df[col].dtype == bool else df[col].notna().sum()
                     print(f"  {col}: {count} instances")
 
+    def validate_trellis_format(self, source_dir, output_dir, verbose=False):
+        """
+        Validate that 3DRealCar data was correctly converted to TRELLIS format.
+        
+        Args:
+            source_dir: Source directory containing 3DRealCar data
+            output_dir: Output directory where TRELLIS format data was saved
+        """
+        def _log(msg):
+            if verbose:
+                _log(msg)
+        
+        print(f"Validating conversion from 3DRealCar to TRELLIS format...")
+        _log(f"Source directory: {source_dir}")
+        _log(f"Output directory: {output_dir}")
+        
+        # Step 1: Check if the preprocessing completed successfully
+        output_path = Path(output_dir)
+        metadata_path = output_path / "metadata.csv"
+        
+        if not metadata_path.exists():
+            _log(f"❌ Metadata file not found at {metadata_path}. Preprocessing may have failed.")
+            return False
+        
+        # Step 2: Inspect metadata file
+        import pandas as pd
+        try:
+            metadata = pd.read_csv(metadata_path)
+            _log(f"✓ Successfully loaded metadata with {len(metadata)} entries")
+            _log(f"  Metadata columns: {', '.join(metadata.columns)}")
+        except Exception as e:
+            _log(f"❌ Failed to load metadata: {e}")
+            return False
+        
+        if len(metadata) == 0:
+            _log(f"❌ Metadata is empty. No cars were processed successfully.")
+            return False
+        
+        # Step 3: Check for a sample car ID
+        sample_car_id = metadata['sha256'].iloc[0]
+        _log(f"Using sample car ID: {sample_car_id}")
+        
+        # Step 4: Check expected TRELLIS directory structure (FIXED)
+        required_dirs = [
+            output_path / "renders" / sample_car_id,
+            output_path / "voxels",
+            output_path / "features" / "dinov2_vitl14_reg",
+        ]
+        
+        for dir_path in required_dirs:
+            if not dir_path.exists():
+                _log(f"❌ Required directory not found: {dir_path}")
+                return False
+            else:
+                _log(f"✓ Found directory: {dir_path}")
+        
+        # Step 5: Check for transforms.json (FIXED path)
+        transforms_path = output_path / "renders" / sample_car_id / "transforms.json"
+        if not transforms_path.exists():
+            _log(f"❌ transforms.json not found at {transforms_path}")
+            return False
+        
+        try:
+            with open(transforms_path, 'r') as f:
+                transforms = json.load(f)
+            _log(f"✓ Successfully loaded transforms.json with {len(transforms['frames'])} frames")
+        except Exception as e:
+            _log(f"❌ Failed to load transforms.json: {e}")
+            return False
+        
+        # Step 6: Check for voxel data (FIXED path)
+        voxel_ply_path = output_path / "voxels" / f"{sample_car_id}.ply"
+        if not voxel_ply_path.exists():
+            _log(f"❌ Voxel PLY file not found at {voxel_ply_path}")
+            return False
+        else:
+            _log(f"✓ Found voxel PLY file: {voxel_ply_path}")
+        
+        # Step 7: Check for rendered images (FIXED path)
+        first_frame = transforms['frames'][0]['file_path']
+        image_path = output_path / "renders" / sample_car_id / first_frame.replace("./", "")
+        
+        if not image_path.exists():
+            _log(f"❌ Rendered image not found at {image_path}")
+            return False
+        else:
+            _log(f"✓ Found rendered image: {image_path}")
+        
+        # Step 8: Check mesh.ply (FIXED path)
+        mesh_path = output_path / "renders" / sample_car_id / "mesh.ply"
+        if not mesh_path.exists():
+            _log(f"❌ Mesh file not found at {mesh_path}")
+            return False
+        else:
+            _log(f"✓ Found mesh file: {mesh_path}")
+        
+        # Step 9: Check for DINOv2 features (FIXED path)
+        features_path = output_path / "features" / "dinov2_vitl14_reg" / f"{sample_car_id}.npz"
+        if not features_path.exists():
+            _log(f"❌ DINOv2 features not found at {features_path}")
+        else:
+            _log(f"✓ Found DINOv2 features: {features_path}")
+        
+        # Step 10: Try loading the data with TRELLIS dataloaders
+        try:
+            # Test SparseStructure dataloader
+            _log("\nTesting TRELLIS dataloaders...")
+            _log("1. Testing SparseStructure dataloader")
+            dataset_ss = SparseStructure(
+                roots=str(output_dir),
+                resolution=64,
+                min_aesthetic_score=0.0  # Set to 0 to include all processed cars
+            )
+            _log(f"✓ Successfully loaded SparseStructure dataset with {len(dataset_ss)} instances")
+            _log(f"  Dataset info:\n{dataset_ss}")
+            
+            # Try loading a sample
+            try:
+                sample = dataset_ss[0]
+                _log(f"✓ Successfully loaded a sample from SparseStructure dataset")
+                _log(f"  Sample contains keys: {list(sample.keys())}")
+                _log(f"  Sample SS shape: {sample['ss'].shape}")
+            except Exception as e:
+                _log(f"❌ Failed to load a sample from SparseStructure dataset: {e}")
+                import traceback
+                traceback._log_exc()
+        except Exception as e:
+            _log(f"❌ Failed to initialize SparseStructure dataset: {e}")
+            import traceback
+            traceback._log_exc()
+        
+        # Test SparseFeat2Render dataloader if DinoV2 features were extracted
+        try:
+            _log("\n2. Testing SparseFeat2Render dataloader")
+            
+            if features_path.exists():
+                dataset_feat = SparseFeat2Render(
+                    roots=str(output_dir),
+                    image_size=224,
+                    model='dinov2_vitl14_reg',
+                    resolution=64,
+                    min_aesthetic_score=0.0
+                )
+                _log(f"✓ Successfully loaded SparseFeat2Render dataset with {len(dataset_feat)} instances")
+                
+                # Try loading a sample
+                try:
+                    sample = dataset_feat[0]
+                    _log(f"✓ Successfully loaded a sample from SparseFeat2Render dataset")
+                    _log(f"  Sample contains keys: {list(sample.keys())}")
+                    _log(f"  Sample feature shape: {sample['feats'].shape}")
+                    _log(f"  Sample coords shape: {sample['coords'].shape}")
+                except Exception as e:
+                    _log(f"❌ Failed to load a sample from SparseFeat2Render dataset: {e}")
+                    import traceback
+                    traceback._log_exc()
+            else:
+                _log("ℹ️ Skipping SparseFeat2Render test - DinoV2 features not found")
+        except Exception as e:
+            _log(f"❌ Failed to initialize SparseFeat2Render dataset: {e}")
+            import traceback
+            traceback._log_exc()
+        
+        # Test SLat2Render dataloader if latents were extracted
+        try:
+            _log("\n3. Testing SLat2Render dataloader")
+            latents_path = output_path / "latents"
+            
+            if latents_path.exists() and any(latents_path.glob("*/*.npz")):
+                latent_model = os.listdir(latents_path)[0]
+                dataset_slat = SLat2Render(
+                    roots=str(output_dir),
+                    image_size=224,
+                    latent_model=latent_model,
+                    min_aesthetic_score=0.0
+                )
+                _log(f"✓ Successfully loaded SLat2Render dataset with {len(dataset_slat)} instances")
+                
+                # Try loading a sample
+                try:
+                    sample = dataset_slat[0]
+                    _log(f"✓ Successfully loaded a sample from SLat2Render dataset")
+                    _log(f"  Sample contains keys: {list(sample.keys())}")
+                except Exception as e:
+                    _log(f"❌ Failed to load a sample from SLat2Render dataset: {e}")
+                    import traceback
+                    traceback._log_exc()
+            else:
+                _log("ℹ️ Skipping SLat2Render test - latent features not found")
+        except Exception as e:
+            _log(f"❌ Failed to initialize SLat2Render dataset: {e}")
+            import traceback
+            traceback._log_exc()
+        
+        _log("\n✅ Validation complete!")
+        return True
 
 # Main preprocessing script
 def preprocess_3drealcar(source_dir, output_dir):
-    processor = RealCar3DProcessor(source_dir, output_dir)
-    source_path = Path(source_dir)
-
-    # Collect all metadata
-    all_metadata = []
-
-    # Check if source_dir itself contains car data
-    if any(source_path.glob("frame_*.json")):
-        # Process the directory itself as a single car
-        # print(f"Processing single car in: {source_path}")
-        try:
-            metadata = processor.process_car(source_path)
-            all_metadata.append(metadata)
-            # print(f"Successfully pre-processed car: {source_path.name}")
-        except Exception as e:
-            print(f"Error processing {source_path}: {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        # Look for subdirectories containing car data
-        print("Looking for car subdirectories...")
-        car_dirs = []
-        for d in source_path.iterdir():
-            if d.is_dir() and any(d.glob("frame_*.json")):
-                car_dirs.append(d)
-
-        if not car_dirs:
-            print(f"No car data found in {source_path}")
-            return
-
-        print(f"Found {len(car_dirs)} cars to process")
-
-        for car_dir in tqdm(car_dirs, desc="Pre-Processing cars"):
-            try:
-                metadata = processor.process_car(car_dir)
-                all_metadata.append(metadata)
-                # print(f"Successfully processed: {car_dir.name}")
-            except Exception as e:
-                print(f"Error processing {car_dir.name}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-
-    # Save metadata CSV in TRELLIS format
-    if all_metadata:
-        import pandas as pd
-        df = pd.DataFrame(all_metadata)
+    processor = RealCar3DProcessor(source_dir, output_dir, run_verifications=False)
+    
+    # Step 1: Convert source directory to TRELLIS format
+    all_metadata = processor.convert_to_trellis()
+    
+    if not all_metadata:
+        print(f"No car data found in {source_dir}")
+        return
         
-        # Save with SHA256 as index (TRELLIS standard)
-        df.set_index('sha256', inplace=True)
-        df.to_csv(processor.output_dir / "metadata.csv")
-        
-        # print(f"✅ Saved TRELLIS-compatible metadata for {len(all_metadata)} cars")
-
-    # Step 1: encode latents
+    # Save initial metadata
+    df = pd.DataFrame(all_metadata)
+    df.to_csv(processor.output_dir / "metadata.csv", index=False)
+    print(f"✅ Converted to TRELLIS format for {len(all_metadata)} cars")
+    
+    # Step 2: Extract DINOv2 features for all cars
+    processor.extract_dino_features_all()
+    
+    # Step 3: Update metadata with feature information
+    processor.update_metadata('features')
+    
+    # Step 4: Encode latents
     processor.run_encode_latents()
-
-    # Step 2: update metadata with latent info
-    processor.update_metadata_with_latents() 
-
-    # Step 3: validate TRELLIS format
-    validation_success = validate_trellis_format(
-        source_dir=str(processor.source_dir),  # if available
+    
+    # Step 5: Update metadata with latent information
+    processor.update_metadata('latents')
+    
+    # Step 6: Validate TRELLIS format
+    validation_success = processor.validate_trellis_format(
+        source_dir=str(processor.source_dir),
         output_dir=str(processor.output_dir)
     )
-
+    
     if not validation_success:
-        print("⚠️ Validation failed — please check the logs above.")
+        print("⚠️ Validation failed: please check the logs.")
     else:
-        print("🎉 All TRELLIS format checks passed.")
-
+        print("✅ Validation complete: all TRELLIS format checks passed.")
 
 if __name__ == "__main__":
-    # Configuration - easily adjustable
-    SAMPLE_DATA_DIR = "./assets/3drealcar/sample-data"
-    OUTPUT_DIR = "./assets/3drealcar/sample-data-processed-trellis"
-    
-    # Process all vehicles in the sample data directory
+    parser = argparse.ArgumentParser(description="Preprocess 3DRealCar dataset into TRELLIS format.")
+    parser.add_argument("--source_dir", type=str, required=True, help="Path to the 3DRealCar source directory")
+    parser.add_argument("--output_dir", type=str, required=True, help="Path to the output directory")
+
+    args = parser.parse_args()
+
     preprocess_3drealcar(
-        source_dir=SAMPLE_DATA_DIR,
-        output_dir=OUTPUT_DIR
+        source_dir=args.source_dir,
+        output_dir=args.output_dir
     )
