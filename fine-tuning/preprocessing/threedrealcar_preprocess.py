@@ -23,13 +23,11 @@ import sys
 from numba import njit
 import subprocess
 # Add the TRELLIS root directory to sys.path
-trellis_root = os.path.join(os.path.dirname(__file__), '..')
-sys.path.insert(0, trellis_root)
+# Go up two levels from preprocessing/ to fine-tuning/ to TRELLIS root
+trellis_root = os.path.join(os.path.dirname(__file__), '..', '..')
+sys.path.insert(0, os.path.abspath(trellis_root))
 from dataset_toolkits.utils import get_file_hash
 from trellis.datasets import SparseStructure, SparseFeat2Render, SLat2Render
-
-
-
 
 # Numba-optimized version of project_dino_features_to_voxels
 @njit
@@ -608,7 +606,8 @@ class RealCar3DProcessor:
         total_valid_projections = 0
         total_out_of_bounds = 0
         
-        for frame_path in tqdm(sampled_frames, desc=f"Extracting features for {sha256[:8]}...", leave=False):
+        for frame_path in sampled_frames:
+            
             frame_name = frame_path.name
             
             if frame_name not in frame_to_transform:
@@ -1236,6 +1235,8 @@ class RealCar3DProcessor:
         latent_dir = (
             self.output_dir / "latents" / "dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16"
         )
+
+        print(str(self.output_dir))
 
         # General check: if any .npz file exists, assume latents are done
         if latent_dir.exists() and any(latent_dir.glob("*.npz")) and not force:
