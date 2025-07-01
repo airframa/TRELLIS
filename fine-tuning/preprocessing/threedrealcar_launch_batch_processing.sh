@@ -25,6 +25,7 @@ run_batch_processing() {
     echo
     
     # Activate conda environment
+    source ~/miniconda3/etc/profile.d/conda.sh
     conda activate trellis
     
     # Run the processor
@@ -91,7 +92,7 @@ case "${1:-menu}" in
     "batch3")
         # Process final batches
         tmux new-session -d -s batch_processing_3 \
-            "bash -c 'source $(readlink -f $0); run_batch_processing \"1600-1800,1800-2045,HQ200,HQ300\" false; exec bash'"
+            "bash -c 'source $(readlink -f $0); run_batch_processing \"HQ300\" false; exec bash'"
         echo "Started batch processing in tmux session: batch_processing_3"
         echo "To attach: tmux attach -t batch_processing_3"
         ;;
