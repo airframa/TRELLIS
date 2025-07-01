@@ -1,7 +1,6 @@
 #!/bin/bash
-# Universal launch script for TRELLIS decoder fine-tuning
+# Universal launch script for TRELLIS decoder fine-tuning: testing different configurations
 # Usage: ./launch_training.sh <config_name> [num_gpus]
-
 # Activate conda environment
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate trellis
