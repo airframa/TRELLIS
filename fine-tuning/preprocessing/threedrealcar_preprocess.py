@@ -3,6 +3,7 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # 0 = all logs, 1 = INFO, 2 = WARNING, 3 = ERRO
 # imports
 import argparse
+import hashlib
 import json
 import random
 import numpy as np
@@ -223,7 +224,15 @@ class RealCar3DProcessor:
             raise FileNotFoundError(f"No mesh file found in {car_dir}")
 
         # Compute SHA256 hash of the mesh file - TRELLIS standard
-        sha256 = get_file_hash(str(mesh_file))
+        # Replace existing SHA256 code with:
+        original_sha256 = get_file_hash(str(mesh_file))
+
+        # For duplicate-prone directories, create unique SHA256
+        if "_ori" in car_dir.name or "_sel" in car_dir.name:
+            unique_id = f"{original_sha256}_{car_dir.name}"
+            sha256 = hashlib.sha256(unique_id.encode()).hexdigest()
+        else:
+            sha256 = original_sha256
 
         # Create directories using SHA256 as identifier (TRELLIS standard)
         renders_dir = self.output_dir / "renders" / sha256
