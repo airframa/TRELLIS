@@ -60,8 +60,20 @@ class DecoderOnlyFinetuneTrainer(SLatVaeGaussianTrainer):
         
         # Rebuild optimizer with only decoder params
         if hasattr(torch.optim, self.optimizer_config['name']):
+            # Get base LR from config
+            lr = self.optimizer_config['args'].get('lr', 5e-05)
+            
+            # Scale LR by number of GPUs
+            if self.world_size > 1:
+                lr *= self.world_size
+            
+            # Create new args dict without invalid parameters
+            optimizer_args = {k: v for k, v in self.optimizer_config['args'].items() 
+                            if k not in ['lr_scale_by_gpus']}
+            optimizer_args['lr'] = lr
+            
             self.optimizer = getattr(torch.optim, self.optimizer_config['name'])(
-                self.master_params, **self.optimizer_config['args']
+                self.master_params, **optimizer_args
             )
         
         # Update EMA params if master
@@ -152,6 +164,8 @@ class DecoderOnlyFinetuneTrainer(SLatVaeGaussianTrainer):
         """
         Override run_snapshot to work with pre-computed latents.
         """
+        # Add this at the start of the function:
+        torch.cuda.empty_cache()
         dataloader = torch.utils.data.DataLoader(
             copy.deepcopy(self.dataset),
             batch_size=batch_size,
@@ -190,7 +204,7 @@ class DecoderOnlyFinetuneTrainer(SLatVaeGaussianTrainer):
         ret_dict.update({f'rec_image': {'value': render_results['color'], 'type': 'image'}})
 
         # render multiview
-        self.renderer.rendering_options.resolution = 512
+        self.renderer.rendering_options.resolution = 256 # 512
         ## Build camera
         yaws = [0, np.pi / 2, np.pi, 3 * np.pi / 2]
         yaws_offset = np.random.uniform(-np.pi / 4, np.pi / 4)
