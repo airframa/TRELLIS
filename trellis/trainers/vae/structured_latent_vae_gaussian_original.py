@@ -7,15 +7,15 @@ from easydict import EasyDict as edict
 import utils3d.torch
 
 from ..basic import BasicTrainer
-from ...representations import Strivec
-from ...renderers import OctreeRenderer
+from ...representations import Gaussian
+from ...renderers import GaussianRenderer
 from ...modules.sparse import SparseTensor
 from ...utils.loss_utils import l1_loss, l2_loss, ssim, lpips
 
 
-class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
+class SLatVaeGaussianTrainer(BasicTrainer):
     """
-    Trainer for structured latent VAE Radiance Field Decoder.
+    Trainer for structured latent VAE.
     
     Args:
         models (dict[str, nn.Module]): Models to train.
@@ -48,6 +48,8 @@ class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
         loss_type (str): Loss type. Can be 'l1', 'l2'
         lambda_ssim (float): SSIM loss weight.
         lambda_lpips (float): LPIPS loss weight.
+        lambda_kl (float): KL loss weight.
+        regularizations (dict): Regularization config.
     """
     
     def __init__(
@@ -56,12 +58,16 @@ class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
         loss_type: str = 'l1',
         lambda_ssim: float = 0.2,
         lambda_lpips: float = 0.2,
+        lambda_kl: float = 1e-6,
+        regularizations: Dict = {},
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.loss_type = loss_type
         self.lambda_ssim = lambda_ssim
         self.lambda_lpips = lambda_lpips
+        self.lambda_kl = lambda_kl
+        self.regularizations = regularizations
         
         self._init_renderer()
         
@@ -69,10 +75,10 @@ class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
         rendering_options = {"near" : 0.8,
                              "far" : 1.6,
                              "bg_color" : 'random'}
-        self.renderer = OctreeRenderer(rendering_options)
-        self.renderer.pipe.primitive = 'trivec'
+        self.renderer = GaussianRenderer(rendering_options)
+        self.renderer.pipe.kernel_size = self.models['decoder'].rep_config['2d_filter_kernel_size']
         
-    def _render_batch(self, reps: List[Strivec], extrinsics: torch.Tensor, intrinsics: torch.Tensor) -> torch.Tensor:
+    def _render_batch(self, reps: List[Gaussian], extrinsics: torch.Tensor, intrinsics: torch.Tensor) -> torch.Tensor:
         """
         Render a batch of representations.
 
@@ -92,10 +98,45 @@ class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
         for k, v in ret.items():
             ret[k] = torch.stack(v, dim=0) 
         return ret
+        
+    @torch.no_grad()
+    def _get_status(self, z: SparseTensor, reps: List[Gaussian]) -> Dict:
+        xyz = torch.cat([g.get_xyz for g in reps], dim=0)
+        xyz_base = (z.coords[:, 1:].float() + 0.5) / self.models['decoder'].resolution - 0.5
+        offset = xyz - xyz_base.unsqueeze(1).expand(-1, self.models['decoder'].rep_config['num_gaussians'], -1).reshape(-1, 3)
+        status = {
+            'xyz': xyz,
+            'offset': offset,
+            'scale': torch.cat([g.get_scaling for g in reps], dim=0),
+            'opacity': torch.cat([g.get_opacity for g in reps], dim=0),
+        }
+
+        for k in list(status.keys()):
+            status[k] = {
+                'mean': status[k].mean().item(),
+                'max': status[k].max().item(),
+                'min': status[k].min().item(),
+            }
+            
+        return status
+    
+    def _get_regularization_loss(self, reps: List[Gaussian]) -> Tuple[torch.Tensor, Dict]:
+        loss = 0.0
+        terms = {}
+        if 'lambda_vol' in self.regularizations:
+            scales = torch.cat([g.get_scaling for g in reps], dim=0)   # [N x 3]
+            volume = torch.prod(scales, dim=1)  # [N]
+            terms[f'reg_vol'] = volume.mean()
+            loss = loss + self.regularizations['lambda_vol'] * terms[f'reg_vol']
+        if 'lambda_opacity' in self.regularizations:
+            opacity = torch.cat([g.get_opacity for g in reps], dim=0)
+            terms[f'reg_opacity'] = (opacity - 1).pow(2).mean()
+            loss = loss + self.regularizations['lambda_opacity'] * terms[f'reg_opacity']
+        return loss, terms
     
     def training_losses(
         self,
-        latents: SparseTensor,
+        feats: SparseTensor,
         image: torch.Tensor,
         alpha: torch.Tensor,
         extrinsics: torch.Tensor,
@@ -107,7 +148,7 @@ class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
         Compute training losses.
 
         Args:
-            latents: The [N x * x C] sparse latents
+            feats: The [N x * x C] sparse tensor of features.
             image: The [N x 3 x H x W] tensor of images.
             alpha: The [N x H x W] tensor of alpha channels.
             extrinsics: The [N x 4 x 4] tensor of extrinsics.
@@ -118,9 +159,10 @@ class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
             a dict with the key "loss" containing a scalar tensor.
             may also contain other keys for different terms.
         """
-        reps = self.training_models['decoder'](latents)
+        z, mean, logvar = self.training_models['encoder'](feats, sample_posterior=True, return_raw=True)
+        reps = self.training_models['decoder'](z)
         self.renderer.rendering_options.resolution = image.shape[-1]
-        render_results = self._render_batch(reps, extrinsics, intrinsics)
+        render_results = self._render_batch(reps, extrinsics, intrinsics)     
         
         terms = edict(loss = 0.0, rec = 0.0)
         
@@ -142,10 +184,19 @@ class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
             terms["lpips"] = lpips(rec_image, gt_image)
             terms["rec"] = terms["rec"] + self.lambda_lpips * terms["lpips"]
         terms["loss"] = terms["loss"] + terms["rec"]
-                
+
+        terms["kl"] = 0.5 * torch.mean(mean.pow(2) + logvar.exp() - logvar - 1)
+        terms["loss"] = terms["loss"] + self.lambda_kl * terms["kl"]
+        
+        reg_loss, reg_terms = self._get_regularization_loss(reps)
+        terms.update(reg_terms)
+        terms["loss"] = terms["loss"] + reg_loss
+        
+        status = self._get_status(z, reps)
+        
         if return_aux:
-            return terms, {}, {'rec_image': rec_image, 'gt_image': gt_image}       
-        return terms, {}
+            return terms, status, {'rec_image': rec_image, 'gt_image': gt_image}       
+        return terms, status
     
     @torch.no_grad()
     def run_snapshot(
@@ -175,10 +226,11 @@ class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
             gt_images.append(args['image'] * args['alpha'][:, None])
             exts.append(args['extrinsics'])
             ints.append(args['intrinsics'])
-            reps.extend(self.models['decoder'](args['latents']))
+            z = self.models['encoder'](args['feats'], sample_posterior=True, return_raw=False)
+            reps.extend(self.models['decoder'](z))
         gt_images = torch.cat(gt_images, dim=0)
         ret_dict.update({f'gt_image': {'value': gt_images, 'type': 'image'}})
-        
+
         # render single view
         exts = torch.cat(exts, dim=0)
         ints = torch.cat(ints, dim=0)
@@ -219,5 +271,5 @@ class SLatVaeRadianceFieldDecoderTrainer(BasicTrainer):
         ret_dict.update({f'miltiview_image': {'value': miltiview_images, 'type': 'image'}})
 
         self.renderer.rendering_options.bg_color = 'random'
-                            
+                                    
         return ret_dict

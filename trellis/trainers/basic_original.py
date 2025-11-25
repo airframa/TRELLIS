@@ -81,21 +81,16 @@ class BasicTrainer(Trainer):
         """
         if self.world_size > 1:
             # Prepare distributed data parallel
-            self.training_models = {}
-            for name, model in self.models.items():
-                # Only wrap models with trainable parameters
-                if any(p.requires_grad for p in model.parameters()):
-                    model = DDP(
-                        model,
-                        device_ids=[self.local_rank],
-                        output_device=self.local_rank,
-                        broadcast_buffers=False,
-                        find_unused_parameters=kwargs.get('find_unused_parameters', False)
-                    )
-                else:
-                    # Keep frozen models as-is (no DDP wrapper)
-                    model = model.to(self.device)
-                self.training_models[name] = model
+            self.training_models = {
+                name: DDP(
+                    model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    bucket_cap_mb=128,
+                    find_unused_parameters=False
+                )
+                for name, model in self.models.items()
+            }
         else:
             self.training_models = self.models
 

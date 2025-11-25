@@ -132,3 +132,4 @@ class SparseFeat2Render(StandardDatasetBase):
             **image,
             **feat,
         }
+

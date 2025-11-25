@@ -159,6 +159,44 @@ class SLatVaeGaussianTrainer(BasicTrainer):
             a dict with the key "loss" containing a scalar tensor.
             may also contain other keys for different terms.
         """
+        
+        # ======================
+        # Memory and scene stats
+        # ======================
+        if self.step % 10 == 0 and self.is_master:
+            # Basic memory stats
+            mem_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+            mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            mem_peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            mem_free, mem_total = torch.cuda.mem_get_info()
+            mem_free_gb = mem_free / (1024 ** 3)
+            mem_total_gb = mem_total / (1024 ** 3)
+            
+            # # Scene complexity stats
+            # num_voxels = feats.coords.shape[0]
+            # expected_gaussians = num_voxels * self.models['decoder'].rep_config['num_gaussians']
+            
+            # # Print detailed report
+            # print(f"\n{'='*60}")
+            # print(f"Memory & Scene Report - Step {self.step}")
+            # print(f"{'='*60}")
+            # print(f"Voxels: {num_voxels} (Max config: {self.dataset.max_num_voxels})")
+            # print(f"Expected Gaussians: {expected_gaussians:,}")
+            # print(f"Memory Allocated: {mem_alloc:.2f}/{mem_total_gb:.2f} GB ({mem_alloc/mem_total_gb*100:.1f}%)")
+            # print(f"Memory Reserved:  {mem_reserved:.2f} GB")
+            # print(f"Peak Memory:      {mem_peak:.2f} GB")
+            # print(f"Free Memory:      {mem_free_gb:.2f} GB")
+            # print(f"{'-'*60}")
+            
+            # # Additional debug info
+            # print(f"Batch Size: {image.shape[0]}")
+            # print(f"Image Size: {image.shape[-2]}x{image.shape[-1]}")
+            # print(f"Extrinsics: {extrinsics.shape}")
+            # print(f"Intrinsics: {intrinsics.shape}")
+            
+            # Reset peak memory for next interval
+            torch.cuda.reset_peak_memory_stats()
+
         z, mean, logvar = self.training_models['encoder'](feats, sample_posterior=True, return_raw=True)
         reps = self.training_models['decoder'](z)
         self.renderer.rendering_options.resolution = image.shape[-1]
