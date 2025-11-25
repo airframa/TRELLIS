@@ -399,3 +399,6 @@ FodyWeavers.xsd
 
 # Obsolete (obsolete folder, miscellaneous files) 
 /obsolete/
+
+# Third party models
+/third_party/
