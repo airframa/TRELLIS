@@ -6,7 +6,8 @@ from trellis.pipelines import TrellisImageTo3DPipeline
 from trellis.utils import render_utils, postprocessing_utils
 
 # Configuration
-CHECKPOINT_PATH = "/data/francMB/threedrealcar/outputs/3drealcar_final_20250703_222220/ckpts/decoder_ema0.9999_step0030000.pt"
+CHECKPOINT_PATH = "/data/fmb/threedrealcar/outputs/3drealcar_vae_20251110_072659/ckpts/decoder_ema0.9999_step0180000.pt"
+# CHECKPOINT_PATH = "/data/fmb/threedrealcar/pretrained/trellis_decoder_gs_pretrained.pt"
 
 # Load the base pipeline
 print("Loading TRELLIS pipeline...")
@@ -29,7 +30,7 @@ if 'slat_decoder_gs' in pipeline.models:
 # pipeline.models['slat_decoder_rf'].load_state_dict(checkpoint)    # For radiance field decoder
 
 # Now use the pipeline as normal
-image = Image.open("assets/example_image/test_image.png")  # Use a car image for testing
+image = Image.open("/data/fmb/threedrealcar/preprocessed/merged/renders/0a2fc455054ec11c14821170410390fbc31337f26506cf717d4f9d5974e6da33/frame_00000.png")  # Use a car image for testing
 
 print("Running inference with fine-tuned model...")
 outputs = pipeline.run(
